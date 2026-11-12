@@ -74,7 +74,8 @@ node test/e2e.mjs dist        # end-to-end test (host + guests in Node, real rel
 - `build.sh`: fetches tailcat at a pinned commit, compiles tailcat's `web/main_js.go`
   to WebAssembly (~27 MB, 6.5 MB gzipped), then adds the page.
 - `.github/workflows/pages.yml`: build + deploy to GitHub Pages on every push to
-  `main`, with the end-to-end test running alongside.
+  `main`. The end-to-end test isn't run there; run it by hand when touching the
+  protocol.
 
 ## Credits
 
