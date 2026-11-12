@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <style>
+    .bubble { fill: #8a5a2b; }
+    .dot { fill: #fff; }
+    @media (prefers-color-scheme: dark) {
+      .bubble { fill: #c99158; }
+      .dot { fill: #1b130b; }
+    }
+  </style>
+  <!-- lit fuse: the chat self-destructs -->
+  <path d="M41.4 16.1C42.9 9.6 49.3 5.9 54.3 6.9A1.6 1.6 0 0 1 53.7 10.1C48.7 9.1 46.1 10.4 44.6 16.9Z" fill="#857b70"/>
+  <path d="M56.5 1.5l1.9 4.6 4.9.5-3.7 3.2 1.1 4.8-4.2-2.6-4.2 2.6 1.1-4.8-3.7-3.2 4.9-.5z" fill="#f5a623"/>
+  <circle cx="56.5" cy="8.6" r="1.8" fill="#fff3c4"/>
+  <!-- speech bubble -->
+  <path class="bubble" d="M18 16h26a14 14 0 0 1 14 14v6a14 14 0 0 1-14 14H25l-12 9.5V49.3A14 14 0 0 1 4 36v-6a14 14 0 0 1 14-14z"/>
+  <circle class="dot" cx="19" cy="33" r="3.8"/>
+  <circle class="dot" cx="31" cy="33" r="3.8"/>
+  <circle class="dot" cx="43" cy="33" r="3.8"/>
+</svg>

@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="description" content="An end-to-end encrypted, serverless private chat that self-destructs.">
+<title>ShitChat</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#8a5a2b">
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-screen="home">
+
+<main id="home" class="screen">
+  <div class="card">
+    <h1 class="logo">Shit<span>Chat</span></h1>
+    <p class="tagline">A private chat that self-destructs.</p>
+    <ul class="features">
+      <li><b>End-to-end encrypted</b> with WireGuard, thanks to
+        <a href="https://github.com/tailscale/tailcat" target="_blank" rel="noopener">tailcat</a>.</li>
+      <li><b>No server, no account, no history.</b> Messages only live in the
+        open tabs.</li>
+      <li><b>The link is the key.</b> When the host closes their tab, the session and the
+        link die forever.</li>
+    </ul>
+    <p id="invite-note" class="note" hidden>📨 You've been invited to a session.</p>
+    <button id="primary-btn" class="btn primary big" disabled>Create a session</button>
+    <progress id="load-progress" max="1" value="0"></progress>
+    <p id="status" class="status" role="status">Loading the WireGuard engine…</p>
+  </div>
+  <footer class="footer">
+    Experimental · encrypted traffic goes through Tailscale's DERP relays ·
+    <a href="https://github.com/lucaslenglet/ShitChat" target="_blank" rel="noopener">source code</a>
+  </footer>
+</main>
+
+<main id="chat" class="screen">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo small">Shit<span>Chat</span></span>
+      <span id="online" class="pill"></span>
+    </div>
+    <div class="actions">
+      <button id="invite-btn" class="btn" type="button">Invite</button>
+      <button id="leave-btn" class="btn danger" type="button">Leave</button>
+    </div>
+  </header>
+
+  <section id="invite" class="invite" hidden>
+    <p>Send this link to the people you want to invite. <b>Anyone with the link can join</b>
+      while the session exists.</p>
+    <div class="linkrow">
+      <input id="invite-link" readonly aria-label="Invite link">
+      <button id="copy-btn" class="btn primary" type="button">Copy</button>
+      <button id="share-btn" class="btn" type="button" hidden>Share</button>
+    </div>
+  </section>
+
+  <ul id="roster" class="roster" aria-label="Participants"></ul>
+
+  <ol id="messages" class="messages" aria-live="polite"></ol>
+
+  <div id="typing" class="typing" aria-live="polite"></div>
+
+  <form id="composer" class="composer">
+    <textarea id="input" rows="1" maxlength="4000" placeholder="Write a message…"
+      autocomplete="off" aria-label="Message"></textarea>
+    <button id="send-btn" class="btn primary" type="submit">Send</button>
+  </form>
+</main>
+
+<main id="ended" class="screen">
+  <div class="card center">
+    <div class="boom" aria-hidden="true">💥</div>
+    <h1 id="ended-title">Session destroyed</h1>
+    <p id="ended-text"></p>
+    <a class="btn primary big" href="./">New session</a>
+  </div>
+</main>
+
+<script src="wasm_exec.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
