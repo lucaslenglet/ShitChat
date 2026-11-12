@@ -12,6 +12,14 @@ the host leaves. Just a static page on GitHub Pages.
 4. When the host closes their tab (or clicks **Destroy**), everyone is disconnected,
    the messages vanish and **the link will never work again**.
 
+Reloading the page doesn't kill anything: host or guest, you pick the session back
+up where you were (same name, same messages). Only closing the tab does.
+
+**Install it as an app** (Android/Chrome: ⋮ menu → *Install app*; iOS/Safari: Share →
+*Add to Home Screen*). It's just a web app manifest: there's no service worker, so
+nothing is cached or stored on the device. On Android, invite links then open
+directly in the app.
+
 ## How it works
 
 ShitChat is built on [tailcat](https://github.com/tailscale/tailcat), Tailscale's
@@ -32,12 +40,19 @@ server. tailcat is compiled to WebAssembly and runs right in the browser.
   WireGuard public key, a random pre-shared key (PSK) and which relay to use. It
   lives after the `#`, which browsers never send to GitHub, and the page wipes it
   from the address bar as soon as it has read it.
-- **Self-destruct.** The host's key is ephemeral: it only exists in their tab's
-  memory. Tab closed ⇒ key gone ⇒ nobody can ever connect to that address again,
-  even with the link.
+- **Self-destruct.** The host's key only lives in their tab: in memory, and in the
+  tab's `sessionStorage` so that a reload can pick it back up. `sessionStorage`
+  belongs to that one tab and is wiped when it closes. Tab closed ⇒ key gone ⇒
+  nobody can ever connect to that address again, even with the link.
+- **Interruptions.** If the host's page goes away without ending the session
+  (reload, phone asleep, flaky network), guests keep trying to reconnect for
+  **30 minutes**, then give up for good. A reloaded host listens again with the same
+  key; a reloaded guest gets their seat back with a secret token from the host.
+  Saved state older than 30 minutes is thrown away, and so is a host page that was
+  frozen longer than that: the session is over.
 - **Star topology.** Each guest has a single tunnel, to the host, which relays the
   messages. Late joiners get the messages exchanged since the session started
-  (kept in the host's memory, nowhere else).
+  (kept by the host's tab, nowhere else).
 - **Protocol.** Newline-delimited JSON over the TCP tunnel (see
   [`web/core.js`](web/core.js)). Heartbeats every 5 s: a participant silent for
   20 s is considered gone.
@@ -46,7 +61,14 @@ server. tailcat is compiled to WebAssembly and runs right in the browser.
 
 - ✅ Messages are end-to-end encrypted by WireGuard (+ PSK). Neither GitHub nor the
   relays can read them or join the session.
-- ✅ Nothing is stored: no account, no database, no `localStorage`.
+- ✅ No account, no database, no `localStorage`. The only thing kept is the tab's
+  own `sessionStorage` (host: key + messages; guest: address + seat), which dies
+  with the tab.
+- ⚠️ While the session runs, the host's `sessionStorage` holds the key and the
+  messages in the clear, and the browser may write it to disk (to restore tabs).
+  Browsers' "reopen closed tab" brings `sessionStorage` back: done within
+  30 minutes, it revives the session. "Duplicate tab" copies it too, which ShitChat
+  detects and refuses.
 - ⚠️ **Anyone who gets the link can join** while the session exists. Send it over
   a channel you trust.
 - ⚠️ In a browser, tailcat can't make direct connections: **all (encrypted)
@@ -57,8 +79,8 @@ server. tailcat is compiled to WebAssembly and runs right in the browser.
   like for any participant).
 - ⚠️ tailcat is experimental with no API stability promises; the version used is
   pinned in [`build.sh`](build.sh).
-- On mobile, if the host switches to another app, the browser may suspend the tab
-  and the session drops.
+- On mobile, if the host switches to another app, the browser may suspend the tab.
+  Guests wait for up to 30 minutes; past that, the session is over.
 
 ## Development
 
@@ -67,7 +89,7 @@ Requirements: Go ≥ 1.27 and git.
 ```sh
 ./build.sh                    # compile tailcat to wasm + copy web/ → dist/
 python3 -m http.server -d dist 8000
-node test/e2e.mjs dist        # end-to-end test (host + guests in Node, real relays)
+node test/e2e.mjs dist        # end-to-end test (host + guests in Node, real relays, ~2 min)
 ```
 
 - `web/`: the page (plain HTML/CSS/JS, no build step). `core.js` = protocol, no DOM.

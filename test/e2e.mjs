@@ -5,7 +5,7 @@
 // and two guests, talking through Tailscale's public DERP relays.
 //
 // Usage: node test/e2e.mjs [dist-dir]   (default: dist, built by ./build.sh)
-// Needs network access. Takes ~1.5 min (the dead-link check waits for
+// Needs network access. Takes ~2.5 min (the dead-link check waits for
 // tailcat's 60 s dial timeout).
 
 import { readFileSync } from "node:fs";
@@ -154,16 +154,66 @@ try {
   ok(cw.messages.length === hub.messages.length && cw.messages[0].text === "salut 👋", "late joiner gets the backlog");
   ok(cw.peers.find((p) => p.id === bw.you.id)?.seen === r2.seen, "late joiner sees existing receipts");
 
+  // ---- A guest reloads: same seat back ----
+  const seatA = a.resume;
+  a.away();
+  a.done = true; // the "page" is gone: no reconnecting from it
+  await H.wait((m) => m.t === "roster" && m.event?.kind === "lost" && m.event.id === aw.you.id);
+  ok(true, "host sees Alice drop out");
+  const A2 = recorder("A2");
+  const a2 = await join(tailcatDial, { addr, derpMapURL, resume: seatA }, A2);
+  const a2w = await A2.wait((m) => m.t === "welcome", 70000, "Alice's welcome back");
+  ok(a2w.you.id === aw.you.id && a2w.you.name === "Alice", `reloaded Alice gets her seat back [${elapsed()}]`);
+  await H.wait((m) => m.t === "roster" && m.event?.kind === "back" && m.event.name === "Alice");
+  ok(true, "host sees Alice come back");
+
+  // ---- The same seat opened twice (duplicated tab): the newest wins ----
+  const A3 = recorder("A3");
+  const a3 = await join(tailcatDial, { addr, derpMapURL, resume: a2.resume }, A3);
+  const a3w = await A3.wait((m) => m.t === "welcome", 70000, "second Alice tab's welcome");
+  const a2c = await A2.wait((m) => m.t === "closed");
+  ok(a3w.you.id === aw.you.id && a2c.reason === "replaced", "the older tab is told it was replaced");
+
+  // ---- The host reloads: same key, same address, everyone comes back ----
+  const snap = JSON.parse(JSON.stringify(hub.snapshot()));
+  hub.ended = true; // the old page is dying: it won't take anyone back
+  hub.pause();
+  await A3.wait((m) => m.t === "reconnecting");
+  await C.wait((m) => m.t === "reconnecting");
+  ok(true, "guests start reconnecting when the host's page goes away");
+  clearInterval(hub.timer);
+  hub.ln.close();
+  const hubR = new Hub({ makeName: () => "Nobody", snapshot: snap });
+  const addrR = await hubR.listen(tailcatListen, { derpMapURL });
+  ok(addrR === addr, "the reloaded host listens on the same address");
+  const HR = recorder("host after reload");
+  const hostR = hubR.openLocal(HR);
+  const hrw = await HR.wait((m) => m.t === "welcome");
+  ok(
+    hrw.you.id === 1 && hrw.you.name === "Host" && hrw.messages.length === snap.messages.length,
+    "host gets its seat and the backlog back",
+  );
+  const a3back = await A3.wait((m) => m.t === "welcome" && m !== a3w, 90000, "Alice back after host reload");
+  const cback = await C.wait((m) => m.t === "welcome" && m !== cw, 90000, "Carol back after host reload");
+  ok(
+    a3back.you.name === "Alice" && cback.you.name === "Carol" && a3back.messages.length === snap.messages.length,
+    `guests are back in their seats with the backlog [${elapsed()}]`,
+  );
+  await B.wait((m) => m.t === "welcome" && m !== bw, 90000, "Bob back after host reload");
+  hostR.send({ t: "msg", text: "re", cid: "r1" });
+  await A3.wait((m) => m.t === "msg" && m.text === "re");
+  ok(true, "messages flow again after the host reloaded");
+
   // ---- Leaving ----
   await b.close();
   const bc = await B.wait((m) => m.t === "closed");
   ok(bc.reason === "left", "Bob's session reports 'left'");
-  const leave = await A.wait((m) => m.t === "roster" && m.event?.kind === "leave" && m.event.name === "Bob");
+  const leave = await A3.wait((m) => m.t === "roster" && m.event?.kind === "leave" && m.event.name === "Bob");
   ok(leave.peers.length === 3, "Alice sees Bob leave (3 peers left)");
 
   // ---- Host destroys the session ----
-  await host.close();
-  const ac = await A.wait((m) => m.t === "closed");
+  await hostR.close();
+  const ac = await A3.wait((m) => m.t === "closed");
   const cc = await C.wait((m) => m.t === "closed");
   ok(ac.reason === "ended" && cc.reason === "ended", `guests are told the session ended [${elapsed()}]`);
 
@@ -182,13 +232,15 @@ try {
   const addr2 = await hub2.listen(tailcatListen, { derpMapURL });
   hub2.openLocal(() => {});
   const D = recorder("D");
-  await join(tailcatDial, { addr: addr2, derpMapURL }, D);
+  await join(tailcatDial, { addr: addr2, derpMapURL, graceMs: 8000 }, D);
   await D.wait((m) => m.t === "welcome");
   clearInterval(hub2.timer); // no more heartbeats…
   hub2.ln.close(); // …and the tailcat server is gone, no "end" sent
   console.log(`  …   host vanished, waiting for the guest to notice [${elapsed()}]`);
-  const dc = await D.wait((m) => m.t === "closed", 40000, "closed after host vanished");
-  ok(dc.reason === "lost", `guest notices a vanished host ('lost') [${elapsed()}]`);
+  await D.wait((m) => m.t === "reconnecting", 40000, "reconnecting after host vanished");
+  ok(true, `guest notices the host is gone and tries to reconnect [${elapsed()}]`);
+  const dc = await D.wait((m) => m.t === "closed", 30000, "closed after the grace period");
+  ok(dc.reason === "lost", `guest gives up after the grace period ('lost') [${elapsed()}]`);
 } catch (err) {
   console.log("  FAIL", err.message);
   failures++;

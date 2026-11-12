@@ -4,7 +4,7 @@
 // web/ package) exposes two globals: tailcatListen and tailcatDial.
 // core.js implements the chat protocol on top of them.
 
-import { Hub, join, HOST_ID, MAX_TEXT, PROTO } from "./core.js";
+import { Hub, join, HOST_ID, MAX_TEXT, PROTO, GRACE_MS } from "./core.js";
 import { randomName } from "./names.js";
 
 const params = new URLSearchParams(location.search);
@@ -30,11 +30,14 @@ let inviteAddr = null;
 }
 
 const S = {
-  session: null, // {send(msg), close()}
+  session: null, // {send(msg), close()} + pause() (host) or away() (guest)
+  hub: null, // host only
   isHost: false,
+  resumed: false, // picked up after a reload
   closed: false,
-  me: null, // {id, name}
+  me: null, // {id, name, token}
   hostId: HOST_ID,
+  addr: "",
   link: "",
   peers: new Map(), // id -> {id, name, delivered, seen}
   typing: new Set(), // peer ids currently typing
@@ -80,6 +83,104 @@ function listNames(names) {
 }
 
 const isActive = () => document.visibilityState === "visible" && document.hasFocus();
+
+// ---------- Surviving a reload ----------
+//
+// The session is kept in sessionStorage, which belongs to this tab only
+// and dies with it: a reload (or the browser discarding a background
+// tab) picks the session back up, closing the tab ends it. The host
+// keeps the tailcat key, the backlog and the seats; a guest keeps the
+// address and their seat. A copy older than GRACE_MS is useless (the
+// guests gave up) and is thrown away, so reopening a closed tab later
+// doesn't bring a dead session back.
+
+const STORE = "shitchat";
+const ALIVE = "shitchat:alive";
+
+function forget() {
+  try {
+    sessionStorage.removeItem(STORE);
+    sessionStorage.removeItem(ALIVE);
+  } catch {}
+}
+
+function touch() {
+  try {
+    sessionStorage.setItem(ALIVE, String(Date.now()));
+  } catch {}
+}
+
+function save(state) {
+  try {
+    sessionStorage.setItem(STORE, JSON.stringify(state));
+    touch();
+  } catch (err) {
+    console.warn("shitchat: couldn't save the session", err);
+  }
+}
+
+function loadSaved() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(STORE));
+    const alive = Number(sessionStorage.getItem(ALIVE));
+    if (saved && Date.now() - alive < GRACE_MS) return saved;
+  } catch {}
+  forget();
+  return null;
+}
+
+setInterval(() => S.session && !S.closed && touch(), 5000);
+
+let saveTimer = 0;
+function saveHost() {
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+  if (S.hub && S.addr && !S.closed) save({ role: "host", addr: S.addr, hub: S.hub.snapshot() });
+}
+function saveHostSoon() {
+  if (!saveTimer) saveTimer = setTimeout(saveHost, 300);
+}
+
+// "Duplicate tab" copies sessionStorage. Ask the other tabs whether the
+// session we're about to resume is still running in one of them.
+const seatKey = (role, addr, token) => `${role}:${addr}:${token ?? ""}`;
+const mySeat = () => S.session && !S.closed && seatKey(S.isHost ? "host" : "guest", S.addr, S.me?.token);
+const channel = "BroadcastChannel" in globalThis ? new BroadcastChannel("shitchat") : null;
+if (channel) {
+  channel.onmessage = (e) => {
+    if (e.data?.t === "who" && e.data.seat === mySeat()) channel.postMessage({ t: "mine", seat: e.data.seat });
+  };
+}
+
+function inUseElsewhere(seat) {
+  if (!channel) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const ask = new BroadcastChannel("shitchat");
+    const done = (v) => {
+      ask.close();
+      resolve(v);
+    };
+    ask.onmessage = (e) => e.data?.t === "mine" && e.data.seat === seat && done(true);
+    ask.postMessage({ t: "who", seat });
+    setTimeout(() => done(false), 400);
+  });
+}
+
+// resumable returns the session this tab can pick back up, if any.
+async function resumable() {
+  const saved = loadSaved();
+  if (!saved) return null;
+  // Opening another invite link in this tab replaces the session.
+  if (inviteAddr && inviteAddr !== saved.addr) {
+    forget();
+    return null;
+  }
+  if (await inUseElsewhere(seatKey(saved.role, saved.addr, saved.resume?.token))) {
+    forget();
+    return null;
+  }
+  return saved;
+}
 
 // ---------- WebAssembly boot ----------
 
@@ -137,27 +238,44 @@ function failed(text) {
   setStatus(text, true);
 }
 
-async function hostSession() {
-  busy("Creating the session…");
+// hostSession creates a session, or resumes the saved one after a reload.
+async function hostSession(saved = null) {
+  busy(saved ? "Restoring your session…" : "Creating the session…");
+  const hub = new Hub({ makeName: randomName, snapshot: saved?.hub, onChange: saveHostSoon });
   try {
-    const hub = new Hub({ makeName: randomName });
     const addr = await hub.listen(globalThis.tailcatListen, { derpMapURL, verbose });
     S.isHost = true;
+    S.resumed = !!saved;
+    S.hub = hub;
+    S.addr = addr;
     S.link = `${baseURL}#${addr}`;
+    saveHost();
     S.session = hub.openLocal(onEvent);
-    $("invite").hidden = false;
+    $("invite").hidden = !!saved;
   } catch (err) {
-    failed(`Couldn't create the session: ${err.message}`);
+    hub.end();
+    forget();
+    inviteAddr = null;
+    $("invite-note").hidden = true;
+    primaryBtn.textContent = "Create a session";
+    failed(`Couldn't ${saved ? "restore" : "create"} the session: ${err.message}`);
   }
 }
 
-async function joinSession() {
-  busy("Connecting to the session… (if it no longer exists, this fails after a minute)");
+// joinSession joins inviteAddr, or takes our seat back after a reload.
+async function joinSession(resume = null) {
+  busy(
+    resume
+      ? "Reconnecting to the session…"
+      : "Connecting to the session… (if it no longer exists, this fails after a minute)",
+  );
   try {
+    S.resumed = !!resume;
+    S.addr = inviteAddr;
     S.link = `${baseURL}#${inviteAddr}`;
     S.session = await join(
       globalThis.tailcatDial,
-      { addr: inviteAddr, derpMapURL, verbose },
+      { addr: inviteAddr, derpMapURL, verbose, resume },
       onEvent,
     );
   } catch (err) {
@@ -183,6 +301,8 @@ function onEvent(m) {
       return onTyping(m);
     case "receipt":
       return onReceipt(m);
+    case "reconnecting":
+      return onReconnecting(m);
     case "closed":
       return onClosed(m.reason);
   }
@@ -193,34 +313,75 @@ function setPeers(list) {
   for (const id of S.typing) if (!S.peers.has(id)) S.typing.delete(id);
 }
 
+// onWelcome runs when we get our seat: first join, and again after each
+// reconnection (the hub then sends the whole backlog again).
 function onWelcome(m) {
   if (m.proto !== PROTO) console.warn("shitchat: protocol mismatch", m.proto, PROTO);
+  const first = !S.me;
   S.me = m.you;
   S.hostId = m.hostId;
+  if (!S.isHost) save({ role: "guest", addr: S.addr, resume: { id: m.you.id, token: m.you.token } });
   setPeers(m.peers);
+  S.typing.clear();
+  // Messages typed while disconnected (or lost in the cut) that the hub
+  // never got: send them again below.
+  const unsent = [...S.pending].filter(
+    ([cid]) => !m.messages.some((x) => x.cid === cid && x.from === m.you.id),
+  );
+  S.pending.clear();
+  S.mine.clear();
+  S.lastMsgId = 0;
+  S.sentReceipt = { delivered: 0, seen: 0 };
   $("messages").replaceChildren();
   for (const msg of m.messages) renderMsg(msg);
-  system(
-    S.isHost
-      ? `Session created. You are ${S.me.name}. Share the link to invite people.`
-      : `You joined the session as ${S.me.name}.`,
-  );
+  if (!first || S.resumed) {
+    system(S.isHost ? `Session restored. You are still ${S.me.name}.` : `Reconnected. You are ${S.me.name}.`);
+  } else {
+    system(
+      S.isHost
+        ? `Session created. You are ${S.me.name}. Share the link to invite people.`
+        : `You joined the session as ${S.me.name}.`,
+    );
+  }
+  for (const [cid, li] of unsent) {
+    li.classList.remove("cont");
+    S.pending.set(cid, li);
+    appendMsg(li, S.me.id, true);
+    S.session?.send({ t: "msg", text: li.querySelector(".text").textContent, cid });
+  }
+  $("conn").hidden = true;
   $("invite-link").value = S.link;
   $("leave-btn").textContent = S.isHost ? "Destroy" : "Leave";
   setScreen("chat");
   renderRoster();
+  renderTyping();
   refreshTicks();
   sendReceipts();
   scrollToBottom(true);
-  $("input").focus();
+  if (first) $("input").focus();
 }
+
+function onReconnecting(m) {
+  stopTyping(false);
+  S.typing.clear();
+  renderTyping();
+  if (!S.me) return; // resuming after a reload: the home screen shows the status
+  const until = fmtTime(m.until);
+  const el = $("conn");
+  el.textContent = `Lost the connection to the host. Reconnecting… (giving up at ${until})`;
+  el.hidden = false;
+}
+
+const ROSTER_VERBS = {
+  join: "joined the session",
+  back: "is back",
+  lost: "lost the connection",
+  leave: "left",
+};
 
 function onRoster(m) {
   setPeers(m.peers);
-  if (m.event) {
-    const verb = m.event.kind === "join" ? "joined the session" : "left";
-    system(`${m.event.name} ${verb}.`);
-  }
+  if (m.event) system(`${m.event.name} ${ROSTER_VERBS[m.event.kind] ?? "left"}.`);
   renderRoster();
   renderTyping();
   refreshTicks();
@@ -256,10 +417,19 @@ function onClosed(reason) {
     showEnded("Session destroyed", "The host ended the session. The messages are gone and the link is dead.");
   } else if (reason === "left") {
     showEnded("You left", "You left the session. The messages are gone from this tab.");
+  } else if (reason === "replaced") {
+    showEnded("Opened elsewhere", "This session was picked up in another tab, so this one stepped aside.");
+  } else if (reason === "expired") {
+    showEnded(
+      "Session expired",
+      "This page was asleep for too long and the guests gave up, so the session was destroyed. The link is dead.",
+    );
   } else {
     showEnded(
       "Session over",
-      "Lost contact with the host: they probably closed their tab, so the session no longer exists.",
+      S.me
+        ? "Lost contact with the host for too long: they probably closed their tab, so the session no longer exists."
+        : "Couldn't get back to the session: the host probably closed their tab, so it no longer exists.",
     );
   }
 }
@@ -267,6 +437,9 @@ function onClosed(reason) {
 function showEnded(title, text) {
   S.closed = true;
   S.session = null;
+  S.hub = null;
+  forget();
+  $("conn").hidden = true;
   S.peers.clear();
   S.pending.clear();
   S.mine.clear();
@@ -553,9 +726,18 @@ window.addEventListener("beforeunload", (e) => {
   }
 });
 
-// Best effort goodbye (guests) or end-of-session notice (host).
+// The page is going away: maybe a reload, maybe the tab closing. Keep
+// the seat either way (sessionStorage only outlives a reload), and warn
+// the others so they reconnect right away.
 window.addEventListener("pagehide", () => {
-  if (S.session && !S.closed) S.session.close();
+  if (!S.session || S.closed) return;
+  if (S.isHost) {
+    saveHost();
+    S.session.pause();
+  } else {
+    S.session.away();
+  }
+  touch();
 });
 
 // ---------- Go ----------
@@ -565,6 +747,8 @@ if (inviteAddr) {
   primaryBtn.textContent = "Join the session";
 }
 
+const savedSession = resumable();
+
 try {
   await bootWasm();
 } catch (err) {
@@ -573,7 +757,13 @@ try {
 }
 $("load-progress").hidden = true;
 
-if (inviteAddr) {
+const saved = await savedSession;
+if (saved?.role === "host") {
+  hostSession(saved);
+} else if (saved?.role === "guest") {
+  inviteAddr = saved.addr;
+  joinSession(saved.resume);
+} else if (inviteAddr) {
   joinSession();
 } else {
   primaryBtn.disabled = false;

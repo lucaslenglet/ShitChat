@@ -1,6 +1,6 @@
 # Builds the site (tailcat compiled to WebAssembly + ShitChat's page) and
 # publishes it to GitHub Pages. The end-to-end test (test/e2e.mjs) is run
-# by hand: it takes ~1.5 min and depends on Tailscale's public relays.
+# by hand: it takes ~2 min and depends on Tailscale's public relays.
 
 name: pages
 
