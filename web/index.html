@@ -27,7 +27,11 @@
         link die forever.</li>
     </ul>
     <p id="invite-note" class="note" hidden>📨 You've been invited to a session.</p>
-    <button id="primary-btn" class="btn primary big" disabled>Create a session</button>
+    <form id="start" class="start">
+      <input id="password" type="password" maxlength="1024" autocomplete="new-password"
+        placeholder="Password (optional)" aria-label="Password (optional)">
+      <button id="primary-btn" class="btn primary big" type="submit" disabled>Create a session</button>
+    </form>
     <progress id="load-progress" max="1" value="0"></progress>
     <p id="status" class="status" role="status">Loading the WireGuard engine…</p>
   </div>
@@ -50,8 +54,10 @@
   </header>
 
   <section id="invite" class="invite" hidden>
-    <p>Send this link to the people you want to invite. <b>Anyone with the link can join</b>
+    <p id="invite-open">Send this link to the people you want to invite. <b>Anyone with the link can join</b>
       while the session exists.</p>
+    <p id="invite-locked" hidden>Send this link to the people you want to invite. They'll also need
+      <b>the password</b>: send it through another channel.</p>
     <div class="linkrow">
       <input id="invite-link" readonly aria-label="Invite link">
       <button id="copy-btn" class="btn primary" type="button">Copy</button>

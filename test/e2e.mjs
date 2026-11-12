@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { createRequire } from "node:module";
 import { join as pathJoin, resolve } from "node:path";
-import { Hub, join } from "../web/core.js";
+import { Hub, join, makeSecret } from "../web/core.js";
 
 const dist = resolve(process.argv[2] ?? "dist");
 const derpMapURL = "https://tailcat.dev/derpmap.json";
@@ -226,6 +226,39 @@ try {
     conn.close();
   } catch {}
   ok(!dialed, `dead link can't be dialed anymore [${elapsed()}]`);
+
+  // ---- Password-protected session ----
+  const hubP = new Hub({ makeName: () => "P" + Math.random(), secret: await makeSecret("hunter2") });
+  const addrP = await hubP.listen(tailcatListen, { derpMapURL });
+  const hostP = hubP.openLocal(() => {});
+  const P = recorder("P");
+  const p = await join(tailcatDial, { addr: addrP, derpMapURL }, P);
+  const pa = await P.wait((m) => m.t === "auth", 70000, "password request");
+  ok(!pa.wrong && !P.events.some((m) => m.t === "welcome"), `the link alone isn't enough: password asked [${elapsed()}]`);
+  p.login("wrong");
+  await P.wait((m) => m.t === "auth" && m.wrong, 15000, "wrong password answer");
+  ok(true, "a wrong password is refused");
+  p.login("hunter2");
+  const pw = await P.wait((m) => m.t === "welcome", 15000, "welcome after the password");
+  ok(pw.peers.length === 2, "the right password lets the guest in");
+  const seatP = p.resume;
+  p.away();
+  p.done = true;
+  const P2 = recorder("P2");
+  await join(tailcatDial, { addr: addrP, derpMapURL, resume: seatP }, P2);
+  await P2.wait((m) => m.t === "welcome", 70000, "seat back without the password");
+  ok(!P2.events.some((m) => m.t === "auth"), "taking a seat back doesn't need the password again");
+  const Q = recorder("Q");
+  const q = await join(tailcatDial, { addr: addrP, derpMapURL }, Q);
+  await Q.wait((m) => m.t === "auth", 70000, "password request");
+  for (const guess of ["a", "b", "c"]) {
+    const answered = Q.events.length;
+    q.login(guess);
+    await Q.wait((m) => Q.events.indexOf(m) >= answered && (m.t === "auth" || m.t === "closed"), 15000, "answer");
+  }
+  const qc = Q.events.find((m) => m.t === "closed");
+  ok(qc?.reason === "denied", `three wrong passwords and you're out [${elapsed()}]`);
+  await hostP.close();
 
   // ---- Host vanishes without saying goodbye (tab killed) ----
   const hub2 = new Hub({ makeName: () => "X" + Math.random() });

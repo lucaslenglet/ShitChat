@@ -160,6 +160,18 @@ progress::-moz-progress-bar { background: var(--accent); }
 .btn.big { padding: 12px 18px; font-size: 1rem; width: 100%; }
 .card.center .btn.big { width: auto; }
 
+.start { display: flex; flex-direction: column; gap: 10px; }
+.start input {
+  font: inherit;
+  padding: 11px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+.start input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.start input:disabled { opacity: 0.5; }
+
 /* Chat layout */
 #chat {
   flex-direction: column;

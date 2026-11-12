@@ -6,8 +6,10 @@ the host leaves. Just a static page on GitHub Pages.
 👉 **https://lucaslenglet.github.io/ShitChat/**
 
 1. Click **Create a session**: your tab becomes the host and gives you a link.
+   You can set a **password** first (optional).
 2. Send the link to whoever you want. Opening it joins the session under a random
-   name ("Philosophical Capybara", "Cranky Narwhal"…).
+   name ("Philosophical Capybara", "Cranky Narwhal"…), after typing the password
+   if there is one.
 3. Chat away: participant count, "X is typing…", sent / delivered / seen.
 4. When the host closes their tab (or clicks **Destroy**), everyone is disconnected,
    the messages vanish and **the link will never work again**.
@@ -53,6 +55,12 @@ server. tailcat is compiled to WebAssembly and runs right in the browser.
 - **Star topology.** Each guest has a single tunnel, to the host, which relays the
   messages. Late joiners get the messages exchanged since the session started
   (kept by the host's tab, nowhere else).
+- **Password (optional).** Without one, the link is enough to get in. With one,
+  the host only lets in guests who send it. It travels inside the WireGuard tunnel,
+  and the host's tab only keeps a salted PBKDF2 hash of it. A guest taking their
+  seat back after a reload doesn't need it again (their secret token is enough).
+  Wrong guesses are slowed down: one per second at most for the whole session, and
+  three per connection.
 - **Protocol.** Newline-delimited JSON over the TCP tunnel (see
   [`web/core.js`](web/core.js)). Heartbeats every 5 s: a participant silent for
   20 s is considered gone.
@@ -69,8 +77,10 @@ server. tailcat is compiled to WebAssembly and runs right in the browser.
   Browsers' "reopen closed tab" brings `sessionStorage` back: done within
   30 minutes, it revives the session. "Duplicate tab" copies it too, which ShitChat
   detects and refuses.
-- ⚠️ **Anyone who gets the link can join** while the session exists. Send it over
-  a channel you trust.
+- ⚠️ **Anyone who gets the link can join** while the session exists, unless you
+  set a password. Send the link over a channel you trust, and the password over
+  another one. Guessing is slowed down but not impossible: pick a real password,
+  not "1234".
 - ⚠️ In a browser, tailcat can't make direct connections: **all (encrypted)
   traffic goes through Tailscale's DERP relays**, which can therefore see who talks
   to whom (IP addresses, ephemeral public keys, traffic volume). These relays are

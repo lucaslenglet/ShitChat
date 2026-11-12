@@ -4,7 +4,7 @@
 // web/ package) exposes two globals: tailcatListen and tailcatDial.
 // core.js implements the chat protocol on top of them.
 
-import { Hub, join, HOST_ID, MAX_TEXT, PROTO, GRACE_MS } from "./core.js";
+import { Hub, join, makeSecret, HOST_ID, MAX_TEXT, PROTO, GRACE_MS } from "./core.js";
 import { randomName } from "./names.js";
 
 const params = new URLSearchParams(location.search);
@@ -35,6 +35,7 @@ const S = {
   isHost: false,
   resumed: false, // picked up after a reload
   closed: false,
+  authPending: false, // guest: the host asked for the password
   me: null, // {id, name, token}
   hostId: HOST_ID,
   addr: "",
@@ -227,22 +228,28 @@ async function bootWasm() {
 // ---------- Starting / joining ----------
 
 const primaryBtn = $("primary-btn");
+const passwordInput = $("password");
 
 function busy(text) {
   primaryBtn.disabled = true;
+  passwordInput.disabled = true;
   setStatus(text);
 }
 
 function failed(text) {
   primaryBtn.disabled = false;
+  passwordInput.disabled = false;
   setStatus(text, true);
 }
 
 // hostSession creates a session, or resumes the saved one after a reload.
 async function hostSession(saved = null) {
   busy(saved ? "Restoring your session…" : "Creating the session…");
-  const hub = new Hub({ makeName: randomName, snapshot: saved?.hub, onChange: saveHostSoon });
+  let hub = null;
   try {
+    const password = saved ? "" : passwordInput.value;
+    const secret = password ? await makeSecret(password) : null;
+    hub = new Hub({ makeName: randomName, snapshot: saved?.hub, secret, onChange: saveHostSoon });
     const addr = await hub.listen(globalThis.tailcatListen, { derpMapURL, verbose });
     S.isHost = true;
     S.resumed = !!saved;
@@ -251,9 +258,12 @@ async function hostSession(saved = null) {
     S.link = `${baseURL}#${addr}`;
     saveHost();
     S.session = hub.openLocal(onEvent);
+    passwordInput.value = "";
+    $("invite-open").hidden = !!hub.secret;
+    $("invite-locked").hidden = !hub.secret;
     $("invite").hidden = !!saved;
   } catch (err) {
-    hub.end();
+    hub?.end();
     forget();
     inviteAddr = null;
     $("invite-note").hidden = true;
@@ -284,13 +294,46 @@ async function joinSession(resume = null) {
   }
 }
 
-primaryBtn.onclick = () => (inviteAddr ? joinSession() : hostSession());
+$("start").onsubmit = (e) => {
+  e.preventDefault();
+  if (S.authPending) sendPassword();
+  else if (inviteAddr) joinSession();
+  else hostSession();
+};
+
+// askPassword: the host wants a password before letting us in.
+function askPassword(wrong) {
+  S.authPending = true;
+  passwordInput.hidden = false;
+  passwordInput.disabled = false;
+  passwordInput.required = true;
+  passwordInput.placeholder = "Password";
+  passwordInput.setAttribute("aria-label", "Password");
+  passwordInput.autocomplete = "current-password";
+  primaryBtn.textContent = "Join";
+  primaryBtn.disabled = false;
+  setStatus(wrong ? "Wrong password, try again." : "This session is protected by a password.", wrong);
+  setScreen("home");
+  passwordInput.value = "";
+  passwordInput.focus();
+}
+
+function sendPassword() {
+  const password = passwordInput.value;
+  if (!password || !S.session) return;
+  S.authPending = false;
+  passwordInput.value = "";
+  busy("Checking the password…");
+  S.session.login(password);
+}
 
 // ---------- Protocol events ----------
 
 function onEvent(m) {
   if (S.closed) return;
   switch (m.t) {
+    case "auth":
+      return askPassword(m.wrong);
     case "welcome":
       return onWelcome(m);
     case "roster":
@@ -316,6 +359,7 @@ function setPeers(list) {
 // onWelcome runs when we get our seat: first join, and again after each
 // reconnection (the hub then sends the whole backlog again).
 function onWelcome(m) {
+  S.authPending = false;
   if (m.proto !== PROTO) console.warn("shitchat: protocol mismatch", m.proto, PROTO);
   const first = !S.me;
   S.me = m.you;
@@ -419,6 +463,11 @@ function onClosed(reason) {
     showEnded("You left", "You left the session. The messages are gone from this tab.");
   } else if (reason === "replaced") {
     showEnded("Opened elsewhere", "This session was picked up in another tab, so this one stepped aside.");
+  } else if (reason === "denied") {
+    showEnded(
+      "Access denied",
+      "Too many wrong passwords, or it took too long to type one. Open the link again to retry.",
+    );
   } else if (reason === "expired") {
     showEnded(
       "Session expired",
@@ -744,6 +793,7 @@ window.addEventListener("pagehide", () => {
 
 if (inviteAddr) {
   $("invite-note").hidden = false;
+  passwordInput.hidden = true;
   primaryBtn.textContent = "Join the session";
 }
 
@@ -767,5 +817,6 @@ if (saved?.role === "host") {
   joinSession();
 } else {
   primaryBtn.disabled = false;
+  passwordInput.disabled = false;
   setStatus("Ready.");
 }

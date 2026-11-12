@@ -10,7 +10,9 @@
 // string "t" (type) field.
 //
 // Guest -> hub:
-//   {t:"hello", proto, resume?:{id, token}}  first message; resume = take my seat back
+//   {t:"hello", proto, resume?:{id, token}, password?}
+//                                   first message; resume = take my seat back.
+//                                   Sent again with a password after an "auth".
 //   {t:"msg", text, cid}            send a chat message (cid = client id for echo matching)
 //   {t:"typing", on}                typing indicator on/off
 //   {t:"receipt", delivered, seen}  highest message ids received / seen
@@ -19,6 +21,9 @@
 //   {t:"bye"}                       leaving for good
 //
 // Hub -> guest:
+//   {t:"auth", wrong}               this session needs a password (wrong: the one
+//                                   sent didn't match): send another hello
+//   {t:"denied"}                    too many wrong passwords, or too slow: bye
 //   {t:"welcome", proto, you:{id,name,token}, hostId, peers, messages}
 //   {t:"roster", peers, event?:{kind:"join"|"back"|"lost"|"leave", id, name}}
 //   {t:"msg", id, from, name, text, ts, cid?}
@@ -37,9 +42,16 @@
 //
 // Sessions surface extra events to the UI:
 //   {t:"reconnecting", until}       lost the host, retrying until that time
-//   {t:"closed", reason:"ended"|"left"|"lost"|"replaced"|"expired"}
+//   {t:"closed", reason:"ended"|"left"|"lost"|"replaced"|"expired"|"denied"}
+//
+// Password: a session can require one. The hub keeps only a salted
+// PBKDF2 hash of it. The password travels inside the WireGuard tunnel,
+// like everything else. A guest taking their seat back with a valid
+// token doesn't need it again. Wrong guesses are slowed down hub-wide
+// (one every WRONG_PASSWORD_DELAY_MS at most) and a connection gets
+// MAX_PASSWORD_TRIES before being hung up on.
 
-export const PROTO = 2;
+export const PROTO = 3;
 export const HOST_ID = 1;
 export const MAX_TEXT = 4000;
 // How long an interrupted session can come back.
@@ -48,6 +60,11 @@ export const GRACE_MS = 30 * 60_000;
 const PING_EVERY_MS = 5_000;
 const DEAD_AFTER_MS = 20_000;
 const HELLO_TIMEOUT_MS = 15_000;
+const AUTH_TIMEOUT_MS = 5 * 60_000; // time to type the password
+const MAX_PASSWORD_TRIES = 3;
+const WRONG_PASSWORD_DELAY_MS = 1_000;
+const MAX_PASSWORD = 1024;
+const PBKDF2_ITERATIONS = 100_000;
 const MAX_LINE = 64 * 1024;
 const BACKLOG = 500;
 
@@ -56,10 +73,42 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const clampInt = (v, lo, hi) =>
   Number.isInteger(v) ? Math.min(hi, Math.max(lo, v)) : lo;
 
+const hex = (buf) => Array.from(new Uint8Array(buf), (x) => x.toString(16).padStart(2, "0")).join("");
+
 function randomToken() {
   const b = new Uint8Array(16);
   crypto.getRandomValues(b);
-  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return hex(b);
+}
+
+async function pbkdf2(password, salt) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: PBKDF2_ITERATIONS },
+    key,
+    256,
+  );
+  return hex(bits);
+}
+
+// makeSecret turns a session password into what the hub keeps: a salted
+// hash, so the password itself is never stored (people reuse them).
+export async function makeSecret(password) {
+  const salt = randomToken();
+  return { salt, hash: await pbkdf2(password, salt) };
+}
+
+async function checkSecret(secret, password) {
+  const h = await pbkdf2(password, secret.salt);
+  let diff = h.length ^ secret.hash.length;
+  for (let i = 0; i < h.length; i++) diff |= h.charCodeAt(i) ^ secret.hash.charCodeAt(i);
+  return diff === 0;
 }
 
 // Line wraps a tailcat conn ({read, write, close}) as an NDJSON channel.
@@ -136,8 +185,11 @@ export class Hub {
   // snapshot: what snapshot() returned before a reload, to pick the
   // session back up with the same key, backlog and seats.
   // onChange: called whenever there's something new to snapshot.
-  constructor({ makeName, snapshot = null, onChange = () => {} }) {
+  // secret: from makeSecret, if the session needs a password.
+  constructor({ makeName, snapshot = null, secret = null, onChange = () => {} }) {
     this.makeName = makeName;
+    this.secret = secret;
+    this.authQueue = Promise.resolve();
     this.onChange = onChange;
     this.peers = new Map(); // connected: id -> {id, name, token, deliver, line, delivered, seen, typing}
     this.away = new Map(); // dropped out, may come back: id -> seat
@@ -150,6 +202,7 @@ export class Hub {
       this.messages = snapshot.messages;
       this.nextPeerId = snapshot.nextPeerId;
       this.nextMsgId = snapshot.nextMsgId;
+      this.secret = snapshot.secret ?? null;
       for (const p of snapshot.peers) this.away.set(p.id, seat(p));
     }
     this.ended = false;
@@ -176,6 +229,7 @@ export class Hub {
   snapshot() {
     return {
       key: this.keyJSON,
+      secret: this.secret,
       nextPeerId: this.nextPeerId,
       nextMsgId: this.nextMsgId,
       messages: this.messages,
@@ -210,15 +264,44 @@ export class Hub {
     }
     const line = new Line(conn);
     let p = null;
-    const timer = setTimeout(() => p || line.close(), HELLO_TIMEOUT_MS);
+    let checking = false; // a hello is being checked
+    let tries = 0; // wrong passwords on this connection
+    let timer = 0;
+    const deadline = (ms, denied) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (p) return;
+        if (denied) Promise.race([line.send({ t: "denied" }), sleep(1000)]).then(() => line.close());
+        else line.close();
+      }, ms);
+    };
+    deadline(HELLO_TIMEOUT_MS, false);
+    const onHello = async (m) => {
+      const ok = await this.authorized(m);
+      if (line.closed || this.ended) return line.close();
+      if (ok) {
+        clearTimeout(timer);
+        p = this.hello(line, m);
+        return;
+      }
+      if (typeof m.password === "string" && ++tries >= MAX_PASSWORD_TRIES) {
+        clearTimeout(timer);
+        await Promise.race([line.send({ t: "denied" }), sleep(1000)]);
+        return line.close();
+      }
+      line.send({ t: "auth", wrong: typeof m.password === "string" });
+      deadline(AUTH_TIMEOUT_MS, true);
+    };
     line
       .read((m) => {
         if (p) {
           if (p.line === line) this.handle(p, m);
-        } else if (m.t === "hello") {
-          clearTimeout(timer);
-          p = this.hello(line, m);
-        } else {
+        } else if (m.t === "ping") {
+          line.send({ t: "ping" }); // waiting for a password: keep the guest's heartbeat happy
+        } else if (m.t === "hello" && !checking) {
+          checking = true;
+          onHello(m).finally(() => (checking = false));
+        } else if (m.t !== "hello") {
           line.close();
         }
       })
@@ -226,6 +309,31 @@ export class Hub {
         clearTimeout(timer);
         if (p) this.lost(p, line);
       });
+  }
+
+  // seatFor returns the seat a resume {id, token} points to, if valid.
+  seatFor(r) {
+    if (!r || typeof r !== "object" || !Number.isInteger(r.id) || typeof r.token !== "string") return null;
+    const s = this.peers.get(r.id) ?? this.away.get(r.id);
+    return s?.token && s.token === r.token ? s : null;
+  }
+
+  // authorized tells whether a hello may get a seat: no password needed,
+  // a valid seat to take back, or the right password. Checks run one at
+  // a time and each wrong one costs WRONG_PASSWORD_DELAY_MS, so guessing
+  // is slow even over many connections at once.
+  authorized(m) {
+    if (!this.secret || this.seatFor(m.resume)) return Promise.resolve(true);
+    if (typeof m.password !== "string") return Promise.resolve(false);
+    const password = m.password.slice(0, MAX_PASSWORD);
+    const run = this.authQueue.then(async () => {
+      if (this.ended) return false;
+      const ok = await checkSecret(this.secret, password);
+      if (!ok) await sleep(WRONG_PASSWORD_DELAY_MS);
+      return ok;
+    });
+    this.authQueue = run.catch(() => {});
+    return run.catch(() => false);
   }
 
   hello(line, m) {
@@ -458,6 +566,7 @@ export class GuestSession {
   constructor(tailcatDial, { addr, derpMapURL, verbose, resume = null, graceMs = GRACE_MS }, onEvent) {
     this.dial = () => tailcatDial({ addr, derpMapURL, verbose });
     this.resume = resume;
+    this.password = null; // the last one we sent, for the hello on reconnections
     this.graceMs = graceMs;
     this.onEvent = onEvent;
     this.line = null;
@@ -474,8 +583,20 @@ export class GuestSession {
     }
     const line = new Line(conn);
     this.line = line;
-    line.send({ t: "hello", proto: PROTO, resume: this.resume });
+    line.send(this.hello());
     this.run(line);
+  }
+
+  hello() {
+    const m = { t: "hello", proto: PROTO, resume: this.resume };
+    if (this.password !== null) m.password = this.password;
+    return m;
+  }
+
+  // login answers an "auth" event with a password.
+  login(password) {
+    this.password = password;
+    this.line?.send(this.hello());
   }
 
   run(line) {
@@ -494,6 +615,9 @@ export class GuestSession {
             return;
           case "replaced":
             outcome = "replaced";
+            return line.close();
+          case "denied":
+            outcome = "denied";
             return line.close();
           case "away":
             return line.close(); // the host is reloading (or leaving)
