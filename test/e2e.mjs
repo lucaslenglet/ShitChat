@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { createRequire } from "node:module";
 import { join as pathJoin, resolve } from "node:path";
-import { Hub, join, makeSecret } from "../web/core.js";
+import { Hub, join, makeSecret, MAX_FILE } from "../web/core.js";
 
 const dist = resolve(process.argv[2] ?? "dist");
 const derpMapURL = "https://tailcat.dev/derpmap.json";
@@ -76,6 +76,7 @@ function recorder(label) {
   return fn;
 }
 
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const t0 = Date.now();
 const elapsed = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
 
@@ -139,6 +140,52 @@ try {
   ok(big.text.length === 4000, "oversized message is truncated to 4000 chars");
   ok(!A.events.some((m) => m.t === "msg" && m.text === "   "), "blank message is dropped");
 
+  // ---- Files ----
+  const bytes = new Uint8Array(300_000);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 7919) & 0xff;
+  const sameBytes = async (blob) => {
+    const got = new Uint8Array(await blob.arrayBuffer());
+    return got.length === bytes.length && got.every((x, i) => x === bytes[i]);
+  };
+  const photo = new File([bytes], "photo 1.jpg", { type: "image/jpeg" });
+  const sent = [];
+  const tf = Date.now();
+  const echoF = await a.putFile("f1", photo, (n) => sent.push(n));
+  ok(echoF.file?.name === "photo 1.jpg" && echoF.file.size === bytes.length && echoF.text === "",
+    `Alice's file is posted as a message [${((Date.now() - tf) / 1000).toFixed(1)}s]`);
+  ok(sent.at(-1) === bytes.length, "upload progress reaches the full size");
+  const bf = await B.wait((m) => m.t === "msg" && m.id === echoF.id);
+  ok(bf.file?.type === "image/jpeg", "Bob gets the file message with its type");
+  const progress = [];
+  const blobB = await b.getFile(bf.id, bf.file, (n) => progress.push(n));
+  ok(await sameBytes(blobB), "Bob downloads the exact bytes");
+  ok(progress.at(-1) === bytes.length, "download progress reaches the full size");
+  ok(await sameBytes(await host.getFile(bf.id)), "the host gets the file without a transfer");
+  const hostFile = await host.putFile("hf", new File([bytes], "../../etc\npasswd", { type: "<script>" }));
+  const af = await A.wait((m) => m.t === "msg" && m.cid === "hf");
+  ok(af.file.name === ".._.._etc_passwd" && af.file.type === "application/octet-stream", "file name and type are sanitized");
+  ok(await sameBytes(await a.getFile(af.id, af.file)), "Alice downloads the host's file");
+  let gone = null;
+  await b.getFile(9999, { size: 10, type: "" }).catch((e) => (gone = e));
+  ok(gone?.gone, "asking for a file that doesn't exist says it's gone");
+  let refused = null;
+  const hubSays = new Promise((resolve, reject) => a.uploads.set("huge", { resolve, reject }));
+  a.line.send({ t: "fput", cid: "huge", name: "x", type: "", size: MAX_FILE + 1 });
+  await hubSays.catch((e) => (refused = e));
+  ok(refused?.refused, "the hub refuses a file over the limit");
+  // Chat keeps flowing while a big file is on its way.
+  const bigFile = new File([new Uint8Array(3 << 20)], "big.bin");
+  let bigDone = false;
+  const bigUp = a.putFile("big", bigFile).then((m) => ((bigDone = true), m));
+  await sleepMs(500);
+  b.send({ t: "msg", text: "pendant le transfert", cid: "during" });
+  await A.wait((m) => m.t === "msg" && m.cid === "during", 30000, "a message during the transfer");
+  ok(!bigDone, "a message gets through while a big file is uploading");
+  const bigMsg = await bigUp;
+  const t3 = Date.now();
+  const bigB = await b.getFile(bigMsg.id, bigMsg.file);
+  ok(bigB.size === 3 << 20, `Bob downloads 3 MB [${((Date.now() - t3) / 1000).toFixed(1)}s]`);
+
   // ---- Receipts ----
   b.send({ t: "receipt", delivered: 2, seen: 1 });
   const r = await A.wait((m) => m.t === "receipt" && m.from === bw.you.id);
@@ -200,6 +247,9 @@ try {
     `guests are back in their seats with the backlog [${elapsed()}]`,
   );
   await B.wait((m) => m.t === "welcome" && m !== bw, 90000, "Bob back after host reload");
+  let goneAfterReload = null;
+  await a3.getFile(bf.id, bf.file).catch((e) => (goneAfterReload = e));
+  ok(goneAfterReload?.gone, "files are gone after the host reloads (memory only)");
   hostR.send({ t: "msg", text: "re", cid: "r1" });
   await A3.wait((m) => m.t === "msg" && m.text === "re");
   ok(true, "messages flow again after the host reloaded");

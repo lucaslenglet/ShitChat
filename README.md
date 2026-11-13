@@ -11,6 +11,10 @@ the host leaves. Just a static page on GitHub Pages.
    name ("Philosophical Capybara", "Cranky Narwhal"…), after typing the password
    if there is one.
 3. Chat away: participant count, "X is typing…", sent / delivered / seen.
+   Send **photos and files** with 📎 (or 📷 on a phone, or paste / drop them):
+   photos show up in the chat, tap one to view it full screen, and every file
+   has a **Save** button (and **Share** on Android, e.g. to put a photo in your
+   gallery). Up to 50 MB per file.
 4. When the host closes their tab (or clicks **Destroy**), everyone is disconnected,
    the messages vanish and **the link will never work again**.
 
@@ -61,8 +65,17 @@ server. tailcat is compiled to WebAssembly and runs right in the browser.
   seat back after a reload doesn't need it again (their secret token is enough).
   Wrong guesses are slowed down: one per second at most for the whole session, and
   three per connection.
+- **Files.** The sender streams the file to the host, which keeps it **in memory
+  only** (up to 150 MB for all files together, the oldest go first) and posts a
+  message about it. Everyone's tab then fetches it from the host automatically and
+  keeps it in memory too, as a `blob:` URL. Nothing is written to disk unless you
+  press Save. File transfers go at a lower priority than messages, so the chat
+  keeps flowing during a transfer. Through the relays, expect a few hundred KB/s
+  (~700 KB/s measured): a phone photo takes a few seconds, a 50 MB video about two
+  minutes, and the host relays it to each participant in turn.
 - **Protocol.** Newline-delimited JSON over the TCP tunnel (see
-  [`web/core.js`](web/core.js)). Heartbeats every 5 s: a participant silent for
+  [`web/core.js`](web/core.js)); file contents travel as raw bytes after their
+  JSON line. Heartbeats every 5 s: a participant silent for
   20 s is considered gone.
 
 ## What it protects, and what it doesn't
@@ -89,6 +102,12 @@ server. tailcat is compiled to WebAssembly and runs right in the browser.
   like for any participant).
 - ⚠️ tailcat is experimental with no API stability promises; the version used is
   pinned in [`build.sh`](build.sh).
+- ⚠️ Files are not kept across a **host reload**: the backlog survives (it's in
+  `sessionStorage`), the files don't (too big for it). Participants who already
+  received a file keep it; the others see "no longer available".
+- ⚠️ Received files are only displayed if they're images or videos in common
+  formats (JPEG, PNG, GIF, WebP, AVIF, MP4, WebM…); everything else can only be
+  saved, never opened inside the page.
 - On mobile, if the host switches to another app, the browser may suspend the tab.
   Guests wait for up to 30 minutes; past that, the session is over.
 

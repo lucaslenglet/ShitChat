@@ -4,7 +4,7 @@
 // web/ package) exposes two globals: tailcatListen and tailcatDial.
 // core.js implements the chat protocol on top of them.
 
-import { Hub, join, makeSecret, HOST_ID, MAX_TEXT, PROTO, GRACE_MS } from "./core.js";
+import { Hub, join, makeSecret, HOST_ID, MAX_TEXT, MAX_FILE, PROTO, GRACE_MS } from "./core.js";
 import { randomName } from "./names.js";
 
 const params = new URLSearchParams(location.search);
@@ -47,6 +47,12 @@ const S = {
   pending: new Map(), // cid -> <li> of a message not yet echoed by the hub
   mine: new Map(), // msg id -> <li> of my messages, for read receipts
   unread: 0,
+  blobs: new Map(), // msg id -> file entry (see fileEntry), in memory only
+  gone: new Set(), // msg ids of files the host no longer has
+  upQueue: [], // cids of my files waiting to be sent, in order
+  uploading: false,
+  downQueue: new Set(), // msg ids of files to fetch
+  downloading: false,
 };
 
 // ---------- Small helpers ----------
@@ -82,6 +88,14 @@ function listNames(names) {
   if (names.length <= 1) return names.join("");
   return names.slice(0, -1).join(", ") + " and " + names.at(-1);
 }
+
+function fmtSize(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1 << 20) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
+  return `${(n / (1 << 20)).toFixed(n < 10 << 20 ? 1 : 0)} MB`;
+}
+
+const newCid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
 const isActive = () => document.visibilityState === "visible" && document.hasFocus();
 
@@ -372,6 +386,10 @@ function onWelcome(m) {
   const unsent = [...S.pending].filter(
     ([cid]) => !m.messages.some((x) => x.cid === cid && x.from === m.you.id),
   );
+  for (const [cid, li] of S.pending) {
+    const done = li._local && m.messages.find((x) => x.cid === cid && x.from === m.you.id);
+    if (done && !S.blobs.has(done.id)) S.blobs.set(done.id, li._local);
+  }
   S.pending.clear();
   S.mine.clear();
   S.lastMsgId = 0;
@@ -387,12 +405,19 @@ function onWelcome(m) {
         : `You joined the session as ${S.me.name}.`,
     );
   }
+  S.upQueue = S.upQueue.filter((cid) => unsent.some(([c]) => c === cid));
   for (const [cid, li] of unsent) {
     li.classList.remove("cont");
     S.pending.set(cid, li);
     appendMsg(li, S.me.id, true);
-    S.session?.send({ t: "msg", text: li.querySelector(".text").textContent, cid });
+    if (li._file) {
+      if (!S.upQueue.includes(cid)) S.upQueue.push(cid);
+    } else {
+      S.session?.send({ t: "msg", text: li.querySelector(".text").textContent, cid });
+    }
   }
+  pumpUploads();
+  pumpDownloads();
   $("conn").hidden = true;
   $("invite-link").value = S.link;
   $("leave-btn").textContent = S.isHost ? "Destroy" : "Leave";
@@ -492,6 +517,12 @@ function showEnded(title, text) {
   S.peers.clear();
   S.pending.clear();
   S.mine.clear();
+  if (viewer.open) viewer.close();
+  for (const e of S.blobs.values()) URL.revokeObjectURL(e.url);
+  S.blobs.clear();
+  S.gone.clear();
+  S.upQueue = [];
+  S.downQueue.clear();
   $("messages").replaceChildren();
   $("ended-title").textContent = title;
   $("ended-text").textContent = text;
@@ -520,7 +551,7 @@ function system(text) {
   scrollToBottom(stick);
 }
 
-function buildMsg({ mine, from, name, text }) {
+function buildMsg({ mine, from, name, text, file }) {
   const li = document.createElement("li");
   li.className = `msg ${mine ? "mine" : "theirs"}`;
   li.dataset.from = from;
@@ -532,9 +563,17 @@ function buildMsg({ mine, from, name, text }) {
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  const p = document.createElement("p");
-  p.className = "text";
-  p.textContent = text;
+  let p;
+  if (file) {
+    bubble.classList.add("has-file");
+    p = document.createElement("div");
+    p.className = "att";
+    li._meta = file;
+  } else {
+    p = document.createElement("p");
+    p.className = "text";
+    p.textContent = text;
+  }
   const meta = document.createElement("span");
   meta.className = "meta";
   const time = document.createElement("time");
@@ -567,11 +606,17 @@ function renderMsg(m) {
   if (li) {
     S.pending.delete(m.cid);
     li.classList.remove("pending");
+    if (li._local && !S.blobs.has(m.id)) S.blobs.set(m.id, li._local);
   } else {
-    li = buildMsg({ mine, from: m.from, name: m.name, text: m.text });
+    li = buildMsg({ mine, from: m.from, name: m.name, text: m.text, file: m.file });
     appendMsg(li, m.from, mine);
   }
   li.dataset.id = m.id;
+  if (m.file) {
+    li._meta = m.file;
+    paintAtt(li);
+    wantFile(m.id);
+  }
   li.querySelector("time").textContent = fmtTime(m.ts);
   S.lastMsgId = Math.max(S.lastMsgId, m.id);
   if (mine) {
@@ -643,6 +688,310 @@ function updateTitle() {
   document.title = S.unread ? `(${S.unread}) ShitChat` : "ShitChat";
 }
 
+// ---------- Files ----------
+//
+// Files live in memory only, as blob: URLs. A received file only gets a
+// type the page can render safely (images and videos from a short list);
+// anything else is application/octet-stream, so it can only be saved,
+// never opened in this page.
+
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp"]);
+const VIDEO_TYPES = new Set(["video/mp4", "video/webm", "video/quicktime"]);
+const kindOf = (type) => (IMAGE_TYPES.has(type) ? "image" : VIDEO_TYPES.has(type) ? "video" : "file");
+
+function fileEntry(blob, meta) {
+  const kind = kindOf(meta.type);
+  const safe = new Blob([blob], { type: kind === "file" ? "application/octet-stream" : meta.type });
+  return { blob: safe, url: URL.createObjectURL(safe), name: meta.name, type: meta.type, kind };
+}
+
+// The share sheet (Android: save to gallery, open in another app…).
+const shareable = (e) => new File([e.blob], e.name, { type: e.type || "application/octet-stream" });
+function canShare(e) {
+  try {
+    return !!navigator.canShare?.({ files: [shareable(e)] });
+  } catch {
+    return false;
+  }
+}
+const share = (e) => navigator.share({ files: [shareable(e)] }).catch(() => {});
+
+const findMsg = (id) => $("messages").querySelector(`li[data-id="${id}"]`);
+
+function el(tag, cls, text) {
+  const x = document.createElement(tag);
+  if (cls) x.className = cls;
+  if (text !== undefined) x.textContent = text;
+  return x;
+}
+
+function saveLink(e) {
+  const a = el("a", "btn small", "Save");
+  a.href = e.url;
+  a.download = e.name;
+  return a;
+}
+
+// paintAtt (re)draws a file message's attachment for its current state.
+function paintAtt(li) {
+  const box = li.querySelector(".att");
+  if (!box) return;
+  const meta = li._meta;
+  const id = Number(li.dataset.id) || 0;
+  const pending = li.classList.contains("pending");
+  const entry = (id && S.blobs.get(id)) || li._local || null;
+  const state = li._failed
+    ? "failed"
+    : pending
+      ? "sending"
+      : entry
+        ? "ready"
+        : S.gone.has(id)
+          ? "gone"
+          : "receiving";
+  const key = `${state} ${entry?.url ?? ""} ${entry?.kind ?? ""}`;
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  const stick = nearBottom();
+  box.replaceChildren();
+
+  const media = entry && entry.kind !== "file" && state !== "failed";
+  if (media) {
+    const broken = () => {
+      entry.kind = "file"; // a format this browser can't show (HEIC…)
+      paintAtt(li);
+    };
+    if (entry.kind === "image") {
+      const btn = el("button", "photo");
+      btn.type = "button";
+      btn.setAttribute("aria-label", `View ${entry.name}`);
+      const img = el("img");
+      img.alt = entry.name;
+      img.src = entry.url;
+      img.onerror = broken;
+      img.onload = () => scrollToBottom(stick);
+      btn.append(img);
+      btn.onclick = () => openViewer(entry);
+      box.append(btn);
+    } else {
+      const v = el("video", "clip");
+      v.controls = true;
+      v.playsInline = true;
+      v.preload = "metadata";
+      v.src = entry.url;
+      v.onerror = broken;
+      v.onloadedmetadata = () => scrollToBottom(stick);
+      box.append(v);
+    }
+  }
+
+  const bar = el("div", "filebar");
+  const info = el("div", "fileinfo");
+  if (!media) info.append(el("span", "fileicon", "📄"));
+  const label = el("div", "filelabel");
+  label.append(el("span", "filename", meta.name), el("span", "filesize", fmtSize(meta.size)));
+  info.append(label);
+  bar.append(info);
+  if (state === "ready") {
+    const actions = el("div", "fileactions");
+    actions.append(saveLink(entry));
+    if (!media && canShare(entry)) {
+      const b = el("button", "btn small", "Share");
+      b.type = "button";
+      b.onclick = () => share(entry);
+      actions.append(b);
+    }
+    bar.append(actions);
+  }
+  box.append(bar);
+
+  if (state === "sending" || state === "receiving") {
+    const st = el("div", "att-status");
+    const prog = el("progress");
+    prog.max = 1;
+    prog.value = 0;
+    st.append(prog, el("span", "pct", state === "sending" ? "Sending…" : "Receiving…"));
+    st.dataset.verb = state === "sending" ? "Sending" : "Receiving";
+    box.append(st);
+  } else if (state === "gone") {
+    box.append(el("div", "att-status note-text", "No longer available (the host reloaded)."));
+  } else if (state === "failed") {
+    box.append(el("div", "att-status note-text", `Not sent: ${li._failed}.`));
+  }
+}
+
+function setProgress(li, n) {
+  const st = li?.querySelector(".att-status");
+  if (!st?.dataset.verb) return;
+  const size = li._meta.size || 1;
+  st.querySelector("progress").value = n / size;
+  st.querySelector(".pct").textContent = `${st.dataset.verb} ${Math.floor((100 * n) / size)}%`;
+}
+
+function sendFiles(files) {
+  if (!S.session || !S.me || S.closed) return;
+  for (const file of files) {
+    if (file.size > MAX_FILE) {
+      system(`"${file.name}" is too big to send (${fmtSize(file.size)}, the limit is ${fmtSize(MAX_FILE)}).`);
+      continue;
+    }
+    const cid = newCid();
+    const meta = { name: file.name || "file", type: (file.type || "").toLowerCase(), size: file.size };
+    const li = buildMsg({ mine: true, from: S.me.id, name: S.me.name, file: meta });
+    li._file = file;
+    li._local = fileEntry(file, meta);
+    li.classList.add("pending");
+    li.querySelector(".ticks").textContent = "🕓";
+    S.pending.set(cid, li);
+    appendMsg(li, S.me.id, true);
+    paintAtt(li);
+    S.upQueue.push(cid);
+  }
+  pumpUploads();
+}
+
+// pumpUploads sends my files one at a time. If the connection drops, it
+// stops; the next welcome queues what didn't make it and starts it again.
+async function pumpUploads() {
+  if (S.uploading) return;
+  S.uploading = true;
+  try {
+    while (S.upQueue.length && S.session && !S.closed) {
+      const cid = S.upQueue[0];
+      const li = S.pending.get(cid);
+      if (!li?._file) {
+        S.upQueue.shift();
+        continue;
+      }
+      try {
+        await S.session.putFile(cid, li._file, (n) => setProgress(li, n));
+        S.upQueue.shift();
+      } catch (err) {
+        if (!err.refused) break;
+        S.upQueue.shift();
+        S.pending.delete(cid);
+        li._failed = err.message === "too-big" ? "too big" : err.message;
+        li.classList.remove("pending");
+        li.querySelector(".ticks").textContent = "⚠️";
+        paintAtt(li);
+      }
+    }
+  } finally {
+    S.uploading = false;
+  }
+}
+
+function wantFile(id) {
+  if (S.blobs.has(id) || S.gone.has(id)) return;
+  S.downQueue.add(id);
+  pumpDownloads();
+}
+
+// pumpDownloads fetches received files one at a time, oldest first.
+async function pumpDownloads() {
+  if (S.downloading) return;
+  S.downloading = true;
+  try {
+    for (const id of S.downQueue) {
+      if (!S.session || S.closed) break;
+      const meta = findMsg(id)?._meta;
+      if (!meta || S.blobs.has(id)) {
+        S.downQueue.delete(id);
+        continue;
+      }
+      try {
+        const blob = await S.session.getFile(id, meta, (n) => setProgress(findMsg(id), n));
+        if (S.closed) break;
+        S.downQueue.delete(id);
+        S.blobs.set(id, fileEntry(blob, meta));
+      } catch (err) {
+        if (!err.gone) break;
+        S.downQueue.delete(id);
+        S.gone.add(id);
+      }
+      const li = findMsg(id);
+      if (li) paintAtt(li);
+    }
+  } finally {
+    S.downloading = false;
+  }
+}
+
+$("attach-btn").onclick = () => $("file-input").click();
+$("camera-btn").hidden = !matchMedia("(pointer: coarse)").matches;
+$("camera-btn").onclick = () => $("camera-input").click();
+for (const id of ["file-input", "camera-input"]) {
+  $(id).onchange = (e) => {
+    sendFiles([...e.target.files]);
+    e.target.value = "";
+  };
+}
+
+// Paste an image, or drop files on the chat.
+$("input").addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files ?? [])];
+  if (!files.length) return;
+  e.preventDefault();
+  sendFiles(files);
+});
+{
+  const chat = $("chat");
+  const hint = $("drop-hint");
+  let depth = 0;
+  const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes("Files");
+  chat.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    depth++;
+    hint.hidden = false;
+  });
+  chat.addEventListener("dragleave", () => {
+    if (--depth <= 0) {
+      depth = 0;
+      hint.hidden = true;
+    }
+  });
+  chat.addEventListener("dragover", (e) => hasFiles(e) && e.preventDefault());
+  chat.addEventListener("drop", (e) => {
+    depth = 0;
+    hint.hidden = true;
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    sendFiles([...e.dataTransfer.files]);
+  });
+}
+
+// ---------- Photo viewer ----------
+//
+// Full screen, on top of the chat. It takes a history entry so that the
+// Android back button closes it instead of leaving the page.
+
+const viewer = $("viewer");
+
+function openViewer(entry) {
+  const img = $("viewer-img");
+  img.src = entry.url;
+  img.alt = entry.name;
+  $("viewer-name").textContent = entry.name;
+  const save = $("viewer-save");
+  save.href = entry.url;
+  save.download = entry.name;
+  const sh = $("viewer-share");
+  sh.hidden = !canShare(entry);
+  sh.onclick = () => share(entry);
+  viewer.showModal();
+  history.pushState({ viewer: true }, "");
+}
+
+viewer.addEventListener("close", () => {
+  $("viewer-img").removeAttribute("src");
+  if (history.state?.viewer) history.back();
+});
+window.addEventListener("popstate", () => viewer.open && viewer.close());
+$("viewer-close").onclick = () => viewer.close();
+viewer.addEventListener("click", (e) => {
+  if (e.target === viewer || e.target.classList.contains("viewer-stage")) viewer.close();
+});
+
 // ---------- Receipts ----------
 
 function sendReceipts() {
@@ -708,7 +1057,7 @@ $("composer").addEventListener("submit", (e) => {
 function sendMessage() {
   const text = input.value.slice(0, MAX_TEXT);
   if (!text.trim() || !S.session) return;
-  const cid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const cid = newCid();
   const li = buildMsg({ mine: true, from: S.me.id, name: S.me.name, text });
   li.classList.add("pending");
   li.querySelector(".ticks").textContent = "🕓";

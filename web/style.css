@@ -392,6 +392,115 @@ progress::-moz-progress-bar { background: var(--accent); }
 .linkrow input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .composer .btn { padding: 10px 16px; }
 
+.btn.icon { padding: 8px 10px; font-size: 1.1rem; line-height: 1; flex: none; }
+.composer .btn.icon { padding: 9px 10px; }
+.btn.small { padding: 4px 10px; font-size: 0.8rem; border-radius: 8px; }
+
+/* Files */
+.bubble.has-file { padding: 4px; min-width: 200px; }
+.bubble.has-file .meta { padding: 0 6px 2px; }
+.att { display: flex; flex-direction: column; gap: 6px; white-space: normal; }
+.photo {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+  border-radius: calc(var(--radius) - 4px);
+  overflow: hidden;
+}
+.photo img, .clip {
+  display: block;
+  max-width: min(100%, 320px);
+  max-height: 360px;
+  border-radius: calc(var(--radius) - 4px);
+  background: var(--surface-2);
+}
+.photo img { min-width: 80px; min-height: 60px; object-fit: cover; }
+.clip { width: 320px; max-width: 100%; }
+.filebar { display: flex; align-items: center; gap: 8px; padding: 2px 6px; }
+.fileinfo { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+.fileicon { font-size: 1.6rem; line-height: 1; }
+.filelabel { display: flex; flex-direction: column; min-width: 0; }
+.filename {
+  font-size: 0.85rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.filesize { font-size: 0.75rem; opacity: 0.75; }
+.fileactions { display: flex; gap: 6px; flex: none; }
+.msg.mine .fileactions .btn {
+  background: rgb(255 255 255 / 0.15);
+  border-color: rgb(255 255 255 / 0.35);
+  color: inherit;
+}
+.att-status { display: flex; align-items: center; gap: 8px; padding: 0 6px 2px; font-size: 0.78rem; }
+.att-status progress { flex: 1; min-width: 60px; }
+.att-status .pct { opacity: 0.8; white-space: nowrap; }
+.note-text { opacity: 0.8; font-style: italic; }
+
+.drop-hint {
+  position: fixed;
+  inset: 12px;
+  border: 3px dashed var(--accent);
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  display: grid;
+  place-items: center;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--accent);
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* Photo viewer */
+.viewer {
+  width: 100vw;
+  height: 100dvh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: #000;
+  color: #fff;
+}
+.viewer[open] { display: flex; flex-direction: column; }
+.viewer::backdrop { background: #000; }
+.viewer-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  background: rgb(0 0 0 / 0.6);
+}
+.viewer-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.9rem;
+}
+.viewer .btn { background: rgb(255 255 255 / 0.12); border-color: rgb(255 255 255 / 0.25); color: #fff; }
+.viewer-stage {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.viewer-stage img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  touch-action: pinch-zoom;
+}
+
 @media (max-width: 520px) {
   .topbar { padding: 8px 12px; }
   .actions .btn { padding: 7px 10px; }
@@ -399,4 +508,7 @@ progress::-moz-progress-bar { background: var(--accent); }
   .msg { max-width: 88%; }
   .linkrow { flex-wrap: wrap; }
   .linkrow input { flex-basis: 100%; }
+  .composer { gap: 6px; padding-left: 10px; padding-right: 10px; }
+  .composer .btn { padding: 10px 12px; }
+  .composer .btn.icon { padding: 9px 8px; }
 }

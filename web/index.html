@@ -74,11 +74,29 @@
   <div id="typing" class="typing" aria-live="polite"></div>
 
   <form id="composer" class="composer">
+    <button id="attach-btn" class="btn icon" type="button" aria-label="Send photos or files"
+      title="Send photos or files">📎</button>
+    <button id="camera-btn" class="btn icon" type="button" aria-label="Take a photo"
+      title="Take a photo" hidden>📷</button>
+    <input id="file-input" type="file" multiple hidden>
+    <input id="camera-input" type="file" accept="image/*" capture="environment" hidden>
     <textarea id="input" rows="1" maxlength="4000" placeholder="Write a message…"
       autocomplete="off" aria-label="Message"></textarea>
     <button id="send-btn" class="btn primary" type="submit">Send</button>
   </form>
+
+  <div id="drop-hint" class="drop-hint" hidden>Drop to send</div>
 </main>
+
+<dialog id="viewer" class="viewer" aria-label="Photo">
+  <div class="viewer-bar">
+    <span id="viewer-name" class="viewer-name"></span>
+    <a id="viewer-save" class="btn" download>Save</a>
+    <button id="viewer-share" class="btn" type="button" hidden>Share</button>
+    <button id="viewer-close" class="btn" type="button" aria-label="Close" autofocus>✕</button>
+  </div>
+  <div class="viewer-stage"><img id="viewer-img" alt=""></div>
+</dialog>
 
 <main id="ended" class="screen">
   <div class="card center">

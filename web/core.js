@@ -7,13 +7,19 @@
 // format, so the UI code doesn't care whether it's hosting or not.
 //
 // Wire format: newline-delimited JSON, one object per line, each with a
-// string "t" (type) field.
+// string "t" (type) field. A line with a "bin": n field is followed by n
+// raw bytes (file contents), handed to the handler as msg.data.
 //
 // Guest -> hub:
 //   {t:"hello", proto, resume?:{id, token}, password?}
 //                                   first message; resume = take my seat back.
 //                                   Sent again with a password after an "auth".
 //   {t:"msg", text, cid}            send a chat message (cid = client id for echo matching)
+//   {t:"fput", cid, name, type, size}
+//                                   start sending a file (replaces my unfinished one)
+//   {t:"fchunk", cid, bin} + bytes  the next piece of it; once size bytes are
+//                                   in, the hub posts it as a message with that cid
+//   {t:"fget", id}                  send me the contents of the file in message id
 //   {t:"typing", on}                typing indicator on/off
 //   {t:"receipt", delivered, seen}  highest message ids received / seen
 //   {t:"ping"}                      heartbeat
@@ -26,7 +32,10 @@
 //   {t:"denied"}                    too many wrong passwords, or too slow: bye
 //   {t:"welcome", proto, you:{id,name,token}, hostId, peers, messages}
 //   {t:"roster", peers, event?:{kind:"join"|"back"|"lost"|"leave", id, name}}
-//   {t:"msg", id, from, name, text, ts, cid?}
+//   {t:"msg", id, from, name, text, ts, cid?, file?:{name, type, size}}
+//   {t:"fdata", id, off, bin} + bytes  a piece of a file asked with fget
+//   {t:"fgone", id}                 the hub doesn't have that file (anymore)
+//   {t:"ferr", cid, reason}         a file was refused ("too-big")
 //   {t:"typing", from, on}
 //   {t:"receipt", from, delivered, seen}
 //   {t:"ping"}
@@ -50,12 +59,25 @@
 // token doesn't need it again. Wrong guesses are slowed down hub-wide
 // (one every WRONG_PASSWORD_DELAY_MS at most) and a connection gets
 // MAX_PASSWORD_TRIES before being hung up on.
+//
+// Files: the sender streams them to the hub, which keeps them in memory
+// only (never in the snapshot: a reloaded host has lost them) and posts a
+// message with the file's name, type and size. Each participant then asks
+// for the contents (fget). Files travel as raw bytes after their JSON
+// line, at a lower priority than everything else, so chat keeps flowing
+// during a transfer.
 
-export const PROTO = 3;
+export const PROTO = 4;
 export const HOST_ID = 1;
 export const MAX_TEXT = 4000;
 // How long an interrupted session can come back.
 export const GRACE_MS = 30 * 60_000;
+export const MAX_FILE = 50 << 20;
+// What the hub keeps at most, all files together: the oldest go first.
+const MAX_STORE = 150 << 20;
+const CHUNK = 32 << 10;
+const MAX_BIN = 64 << 10;
+const MAX_STREAMS = 3; // files sent at once to one participant
 
 const PING_EVERY_MS = 5_000;
 const DEAD_AFTER_MS = 20_000;
@@ -72,6 +94,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const clampInt = (v, lo, hi) =>
   Number.isInteger(v) ? Math.min(hi, Math.max(lo, v)) : lo;
+
+// cleanFile sanitizes the file metadata a sender gave.
+function cleanFile(m) {
+  let name = typeof m.name === "string" ? m.name : "";
+  name = name.replace(/[\u0000-\u001f\u007f/\\]/g, "_").trim().slice(0, 200) || "file";
+  const type =
+    typeof m.type === "string" && /^[\w.+-]{1,60}\/[\w.+-]{1,60}$/.test(m.type)
+      ? m.type.toLowerCase()
+      : "application/octet-stream";
+  return { name, type, size: m.size };
+}
 
 const hex = (buf) => Array.from(new Uint8Array(buf), (x) => x.toString(16).padStart(2, "0")).join("");
 
@@ -113,56 +146,120 @@ async function checkSecret(secret, password) {
 
 // Line wraps a tailcat conn ({read, write, close}) as an NDJSON channel.
 // Writes are serialized: each conn.write runs on its own Go goroutine,
-// so firing them concurrently could reorder messages on the wire.
+// so firing them concurrently could reorder messages on the wire. Bulk
+// writes (file pieces) wait for the regular ones to be out.
 class Line {
   constructor(conn) {
     this.conn = conn;
-    this.queue = Promise.resolve();
+    this.urgent = [];
+    this.bulk = [];
+    this.writing = false;
     this.closed = false;
     this.lastRx = Date.now();
     this.enc = new TextEncoder();
   }
 
+  frame(obj, data) {
+    if (!data) return this.enc.encode(JSON.stringify(obj) + "\n");
+    const head = this.enc.encode(JSON.stringify({ ...obj, bin: data.byteLength }) + "\n");
+    const out = new Uint8Array(head.byteLength + data.byteLength);
+    out.set(head);
+    out.set(data, head.byteLength);
+    return out;
+  }
+
+  // send resolves once the message is written (or the line is closed).
   send(obj) {
+    return this.enqueue(this.urgent, this.frame(obj));
+  }
+
+  // sendBulk sends obj followed by the bytes in data, after any pending send.
+  sendBulk(obj, data) {
+    return this.enqueue(this.bulk, this.frame(obj, data));
+  }
+
+  enqueue(queue, bytes) {
     if (this.closed) return Promise.resolve();
-    const bytes = this.enc.encode(JSON.stringify(obj) + "\n");
-    this.queue = this.queue
-      .then(() => (this.closed ? undefined : this.conn.write(bytes)))
-      .catch(() => this.close());
-    return this.queue;
+    return new Promise((done) => {
+      queue.push({ bytes, done });
+      this.pump();
+    });
+  }
+
+  async pump() {
+    if (this.writing) return;
+    this.writing = true;
+    for (let item; !this.closed && (item = this.urgent.shift() ?? this.bulk.shift()); ) {
+      try {
+        await this.conn.write(item.bytes);
+      } catch {
+        this.close();
+      }
+      item.done();
+    }
+    this.writing = false;
   }
 
   // read pumps incoming messages to onMessage until the stream ends,
   // fails, or close() is called. It resolves once the line is closed.
   async read(onMessage) {
     const dec = new TextDecoder();
-    let buf = "";
+    let buf = new Uint8Array(0);
+    let waiting = null; // a message whose bytes haven't all arrived yet
+    const dispatch = (msg) => {
+      try {
+        onMessage(msg);
+      } catch (err) {
+        console.error("shitchat: handler error", err);
+      }
+    };
     try {
       for (let chunk; !this.closed && (chunk = await this.conn.read()) !== null; ) {
         this.lastRx = Date.now();
-        buf += dec.decode(chunk, { stream: true });
-        let nl;
-        while (!this.closed && (nl = buf.indexOf("\n")) >= 0) {
-          const raw = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
+        if (!(chunk instanceof Uint8Array)) chunk = new Uint8Array(chunk);
+        if (buf.byteLength) {
+          const b = new Uint8Array(buf.byteLength + chunk.byteLength);
+          b.set(buf);
+          b.set(chunk, buf.byteLength);
+          buf = b;
+        } else {
+          buf = chunk;
+        }
+        let pos = 0;
+        while (!this.closed) {
+          if (waiting) {
+            if (buf.byteLength - pos < waiting.bin) break;
+            waiting.data = buf.slice(pos, pos + waiting.bin);
+            pos += waiting.bin;
+            const msg = waiting;
+            waiting = null;
+            dispatch(msg);
+            continue;
+          }
+          const nl = buf.indexOf(10, pos);
+          if (nl < 0) break;
+          const raw = dec.decode(buf.subarray(pos, nl));
+          pos = nl + 1;
           let msg;
           try {
             msg = JSON.parse(raw);
           } catch {
             continue;
           }
-          if (msg && typeof msg === "object" && typeof msg.t === "string") {
-            try {
-              onMessage(msg);
-            } catch (err) {
-              console.error("shitchat: handler error", err);
-            }
+          if (!msg || typeof msg !== "object" || typeof msg.t !== "string") continue;
+          delete msg.data;
+          if (msg.bin !== undefined) {
+            if (!Number.isInteger(msg.bin) || msg.bin < 0 || msg.bin > MAX_BIN) throw new Error("bad frame");
+            waiting = msg;
+          } else {
+            dispatch(msg);
           }
         }
-        if (buf.length > MAX_LINE) break; // garbage or abuse: hang up
+        buf = pos ? buf.slice(pos) : buf;
+        if (!waiting && buf.byteLength > MAX_LINE) break; // garbage or abuse: hang up
       }
     } catch {
-      // read error: the connection is gone
+      // read error (or garbage): the connection is gone
     }
     this.close();
   }
@@ -170,6 +267,7 @@ class Line {
   close() {
     if (this.closed) return;
     this.closed = true;
+    for (const item of [...this.urgent.splice(0), ...this.bulk.splice(0)]) item.done();
     try {
       this.conn.close();
     } catch {}
@@ -194,6 +292,8 @@ export class Hub {
     this.peers = new Map(); // connected: id -> {id, name, token, deliver, line, delivered, seen, typing}
     this.away = new Map(); // dropped out, may come back: id -> seat
     this.messages = [];
+    this.files = new Map(); // message id -> Blob, in memory only
+    this.fileBytes = 0;
     this.nextPeerId = HOST_ID;
     this.nextMsgId = 1;
     this.keyJSON = "";
@@ -254,6 +354,18 @@ export class Hub {
       send: (m) => this.handle(p, m),
       close: () => this.end(),
       pause: () => this.pause(),
+      // The host's own files don't need to travel: hand them over as is.
+      putFile: async (cid, file, onProgress) => {
+        if (file.size > MAX_FILE) throw Object.assign(new Error("too-big"), { refused: true });
+        if (this.ended || this.peers.get(p.id) !== p) throw new Error("interrupted");
+        onProgress?.(file.size);
+        return JSON.parse(JSON.stringify(this.addFile(p, cid, cleanFile(file), file)));
+      },
+      getFile: async (id) => {
+        const blob = this.files.get(id);
+        if (!blob) throw Object.assign(new Error("gone"), { gone: true });
+        return blob;
+      },
     };
   }
 
@@ -420,22 +532,35 @@ export class Hub {
         if (typeof m.text !== "string") return;
         const text = m.text.slice(0, MAX_TEXT);
         if (!text.trim()) return;
-        const msg = {
-          t: "msg",
-          id: this.nextMsgId++,
-          from: p.id,
-          name: p.name,
-          text,
-          ts: Date.now(),
-        };
-        if (typeof m.cid === "string") msg.cid = m.cid.slice(0, 64);
-        this.messages.push(msg);
-        if (this.messages.length > BACKLOG) this.messages.shift();
-        p.typing = false;
-        this.broadcast(msg);
-        this.onChange();
+        this.post(p, { text, cid: m.cid });
         break;
       }
+      case "fput": {
+        if (!p.line || typeof m.cid !== "string") return;
+        p.upload = null;
+        if (!Number.isInteger(m.size) || m.size < 0 || m.size > MAX_FILE) {
+          p.deliver({ t: "ferr", cid: m.cid.slice(0, 64), reason: "too-big" });
+          return;
+        }
+        p.upload = { cid: m.cid, meta: cleanFile(m), parts: [], got: 0 };
+        if (m.size === 0) this.uploaded(p);
+        break;
+      }
+      case "fchunk": {
+        const u = p.upload;
+        if (!u || m.cid !== u.cid || !(m.data instanceof Uint8Array)) return;
+        if (u.got + m.data.byteLength > u.meta.size) {
+          p.upload = null;
+          return;
+        }
+        u.parts.push(m.data);
+        u.got += m.data.byteLength;
+        if (u.got === u.meta.size) this.uploaded(p);
+        break;
+      }
+      case "fget":
+        this.stream(p, m.id);
+        break;
       case "typing": {
         const on = !!m.on;
         if (on === p.typing) return;
@@ -460,6 +585,69 @@ export class Hub {
       case "bye":
         this.drop(p);
         break;
+    }
+  }
+
+  // post adds a message from p to the backlog and sends it to everyone.
+  post(p, { text = "", cid, file }) {
+    const msg = {
+      t: "msg",
+      id: this.nextMsgId++,
+      from: p.id,
+      name: p.name,
+      text,
+      ts: Date.now(),
+    };
+    if (typeof cid === "string") msg.cid = cid.slice(0, 64);
+    if (file) msg.file = file;
+    this.messages.push(msg);
+    if (this.messages.length > BACKLOG) this.forgetFile(this.messages.shift().id);
+    p.typing = false;
+    this.broadcast(msg);
+    this.onChange();
+    return msg;
+  }
+
+  uploaded(p) {
+    const u = p.upload;
+    p.upload = null;
+    this.addFile(p, u.cid, u.meta, new Blob(u.parts, { type: u.meta.type }));
+  }
+
+  addFile(p, cid, meta, blob) {
+    while (this.files.size && this.fileBytes + blob.size > MAX_STORE) {
+      this.forgetFile(this.files.keys().next().value);
+    }
+    const msg = this.post(p, { cid, file: { name: meta.name, type: meta.type, size: blob.size } });
+    this.files.set(msg.id, blob);
+    this.fileBytes += blob.size;
+    return msg;
+  }
+
+  forgetFile(id) {
+    const blob = this.files.get(id);
+    if (!blob) return;
+    this.files.delete(id);
+    this.fileBytes -= blob.size;
+  }
+
+  // stream sends a file to a guest, piece by piece, each one waiting for
+  // the previous one to be out: memory stays flat whatever the size.
+  async stream(p, id) {
+    const line = p.line;
+    if (!line) return;
+    const blob = this.files.get(id);
+    if (!blob) return line.send({ t: "fgone", id: Number.isInteger(id) ? id : 0 });
+    if ((line.streams ?? 0) >= MAX_STREAMS) return;
+    line.streams = (line.streams ?? 0) + 1;
+    try {
+      for (let off = 0; off < blob.size; off += CHUNK) {
+        if (line.closed || p.line !== line || this.ended) return;
+        const data = new Uint8Array(await blob.slice(off, off + CHUNK).arrayBuffer());
+        await line.sendBulk({ t: "fdata", id, off }, data);
+      }
+    } finally {
+      line.streams--;
     }
   }
 
@@ -553,6 +741,8 @@ export class Hub {
     this.peers.clear();
     this.away.clear();
     this.messages = [];
+    this.files.clear();
+    this.fileBytes = 0;
     try {
       this.ln?.close();
     } catch {}
@@ -571,6 +761,8 @@ export class GuestSession {
     this.onEvent = onEvent;
     this.line = null;
     this.done = false;
+    this.uploads = new Map(); // cid -> {resolve, reject}
+    this.downloads = new Map(); // id -> {parts, got, size, type, onProgress, resolve, reject}
   }
 
   // connect makes one attempt, and rejects if the host can't be reached
@@ -624,11 +816,23 @@ export class GuestSession {
           case "welcome":
             this.resume = { id: m.you.id, token: m.you.token };
             break;
+          case "msg":
+            if (m.cid && m.from === this.resume?.id) this.settle(this.uploads, m.cid, null, m);
+            break;
+          case "ferr":
+            return this.settle(this.uploads, m.cid, Object.assign(new Error(m.reason), { refused: true }));
+          case "fgone":
+            return this.settle(this.downloads, m.id, Object.assign(new Error("gone"), { gone: true }));
+          case "fdata":
+            return this.onData(m);
         }
         this.onEvent(m);
       })
       .then(() => {
         clearInterval(timer);
+        for (const map of [this.uploads, this.downloads]) {
+          for (const key of [...map.keys()]) this.settle(map, key, new Error("interrupted"));
+        }
         if (this.line === line) this.line = null;
         if (this.done) return;
         if (outcome) this.finish(outcome);
@@ -660,6 +864,57 @@ export class GuestSession {
     this.done = true;
     this.line?.close();
     this.onEvent({ t: "closed", reason });
+  }
+
+  settle(map, key, err, value) {
+    const op = map.get(key);
+    if (!op) return;
+    map.delete(key);
+    if (err) op.reject(err);
+    else op.resolve(value);
+  }
+
+  onData(m) {
+    const d = this.downloads.get(m.id);
+    if (!d || !(m.data instanceof Uint8Array) || m.off !== d.got) return;
+    d.parts.push(m.data);
+    d.got += m.data.byteLength;
+    d.onProgress?.(d.got);
+    if (d.got >= d.size) this.settle(this.downloads, m.id, null, new Blob(d.parts, { type: d.type }));
+  }
+
+  // putFile sends a file (a Blob/File) and resolves once the hub has
+  // posted it (with this cid). onProgress gets the bytes sent so far.
+  // It rejects with .refused if the hub said no, or if the connection
+  // dropped meanwhile ("interrupted": try again after the next welcome).
+  async putFile(cid, file, onProgress) {
+    const line = this.line;
+    if (!line || this.done) throw new Error("interrupted");
+    if (file.size > MAX_FILE) throw Object.assign(new Error("too-big"), { refused: true });
+    const posted = new Promise((resolve, reject) => this.uploads.set(cid, { resolve, reject }));
+    posted.catch(() => {}); // awaited below, after the sending loop
+    line.send({ t: "fput", cid, name: file.name, type: file.type, size: file.size });
+    for (let off = 0; off < file.size; off += CHUNK) {
+      if (line.closed || !this.uploads.has(cid)) break;
+      const data = new Uint8Array(await file.slice(off, off + CHUNK).arrayBuffer());
+      await line.sendBulk({ t: "fchunk", cid }, data);
+      onProgress?.(off + data.byteLength);
+    }
+    return posted;
+  }
+
+  // getFile fetches the contents of the file posted in message id.
+  // Rejects with .gone if the hub doesn't have it, or "interrupted".
+  getFile(id, { size, type }, onProgress) {
+    if (!size) return Promise.resolve(new Blob([], { type }));
+    const line = this.line;
+    if (!line || this.done) return Promise.reject(new Error("interrupted"));
+    this.settle(this.downloads, id, new Error("interrupted"));
+    const p = new Promise((resolve, reject) =>
+      this.downloads.set(id, { parts: [], got: 0, size, type, onProgress, resolve, reject }),
+    );
+    line.send({ t: "fget", id });
+    return p;
   }
 
   // send is a no-op while reconnecting.
