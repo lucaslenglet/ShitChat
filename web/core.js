@@ -22,7 +22,8 @@
 //   {t:"fget", id}                  send me the contents of the file in message id
 //   {t:"typing", on}                typing indicator on/off
 //   {t:"receipt", delivered, seen}  highest message ids received / seen
-//   {t:"lock", on}                  host only: stop / start letting newcomers in
+//   {t:"set", settings}             host only: change some settings (a partial
+//                                   object, see cleanSettings), e.g. {locked:true}
 //   {t:"kick", id}                  host only: throw that participant out
 //   {t:"ping"}                      heartbeat
 //   {t:"away"}                      my page is going away (reload?): keep my seat
@@ -35,15 +36,17 @@
 //   {t:"full"}                      the session has reached its max people: bye
 //   {t:"locked"}                    the host isn't letting anyone new in: bye
 //   {t:"kicked"}                    the host threw you out: bye
-//   {t:"welcome", proto, you:{id,name,token}, hostId, peers, messages, settings}
+//   {t:"welcome", proto, you:{id,name,token}, hostId, peers, messages, settings,
+//    password}                     password: whether the link alone isn't enough
 //   {t:"roster", peers, event?:{kind:"join"|"back"|"lost"|"leave"|"kicked", id, name}}
-//   {t:"settings", settings}        the host changed a setting (locked)
+//   {t:"settings", settings}        the host changed some settings (all of them
+//                                   are sent; the UI tells what changed)
 //   {t:"msg", id, from, name, text, ts, cid?, file?:{name, type, size}}
 //   {t:"fdata", id, off, bin} + bytes  a piece of a file asked with fget
-//   {t:"fgone", id}                 the hub doesn't have that file (anymore)
+//   {t:"fgone", id}                 the hub doesn't have that file (anymore), or
+//                                   it was posted before you joined and the
+//                                   history is hidden from newcomers
 //   {t:"ferr", cid, reason}         a file was refused ("too-big", "not-allowed")
-//   {t:"fgone", id} also answers an fget for a file posted before you joined,
-//                                   when the history is hidden from newcomers
 //   {t:"typing", from, on}
 //   {t:"receipt", from, delivered, seen}
 //   {t:"ping"}
@@ -60,7 +63,8 @@
 // Sessions surface extra events to the UI:
 //   {t:"reconnecting", until}       lost the host, retrying until that time
 //   {t:"closed", reason:"ended"|"left"|"lost"|"replaced"|"expired"|"denied"|"full"
-//                       |"locked"|"kicked"}
+//                       |"locked"|"kicked"|"destroyed"}
+//                                   ("destroyed": the host's own UI, after close)
 //
 // Password: a session can require one. The hub keeps only a salted
 // PBKDF2 hash of it. The password travels inside the WireGuard tunnel,
@@ -77,8 +81,11 @@
 // during a transfer.
 //
 // Settings: the host picks them when creating the session (see
-// cleanSettings) and the hub enforces them; guests get them in the
-// welcome so their UI can follow. The host itself is never restricted
+// cleanSettings) and can change any of them during it ("set"); the hub
+// enforces them. Guests get them in the welcome, then a "settings" on
+// every change, so their UI can follow. A change only applies from then
+// on: lowering maxPeople throws nobody out, history only concerns the
+// next newcomers, maxFile only the next files. The host itself is never restricted
 // by chat and files; the others apply to everyone.
 //   maxPeople  0 = no limit, else how many seats in all (host included;
 //              a guest who dropped out keeps their seat for GRACE_MS)
@@ -91,13 +98,13 @@
 //   typing     false: no "X is typing" (the hub drops them)
 //   autoload   false: received files are fetched when asked for (default)
 //              true: right away (a UI matter, the hub doesn't care)
-//   locked     nobody new can join; the host toggles it during the session
+//   locked     nobody new can join (meant to be toggled during the session)
 //
 // Kicking: the host can throw a participant out. Their seat is gone and
 // their id is remembered, so their tab can't quietly sneak back in with
 // its old seat; opening the link again is a new arrival (lock to stop it).
 
-export const PROTO = 5;
+export const PROTO = 6;
 export const HOST_ID = 1;
 export const MAX_TEXT = 4000;
 // How long an interrupted session can come back.
@@ -132,12 +139,15 @@ export const DEFAULT_SETTINGS = Object.freeze({
   locked: false,
 });
 export const MAX_PEOPLE = 100;
+
+// allowed tells whether participant id may send ("chat" or "files"):
+// the host always may.
+export const allowed = (settings, id, what) => id === HOST_ID || settings[what] === "all";
 const MIN_MAX_FILE = 1 << 20;
 
 // cleanSettings fills in and checks what the host asked for.
 export function cleanSettings(s) {
-  const d = DEFAULT_SETTINGS;
-  if (!s || typeof s !== "object") return { ...d };
+  if (!s || typeof s !== "object") s = {};
   const n = Number(s.maxPeople);
   const f = Number(s.maxFile);
   return {
@@ -211,6 +221,19 @@ async function checkSecret(secret, password) {
 // Writes are serialized: each conn.write runs on its own Go goroutine,
 // so firing them concurrently could reorder messages on the wire. Bulk
 // writes (file pieces) wait for the regular ones to be out.
+// concat joins two byte arrays (b itself if a is empty).
+function concat(a, b) {
+  if (!a.byteLength) return b;
+  const out = new Uint8Array(a.byteLength + b.byteLength);
+  out.set(a);
+  out.set(b, a.byteLength);
+  return out;
+}
+
+// Errors the UI tells apart: the hub refused a file, or doesn't have it.
+const refused = (reason) => Object.assign(new Error(reason), { refused: true });
+const gone = () => Object.assign(new Error("gone"), { gone: true });
+
 class Line {
   constructor(conn) {
     this.conn = conn;
@@ -265,10 +288,12 @@ class Line {
 
   // read pumps incoming messages to onMessage until the stream ends,
   // fails, or close() is called. It resolves once the line is closed.
+  // Binary payloads are copied once, straight into a buffer of their
+  // final size, however many reads they arrive in.
   async read(onMessage) {
     const dec = new TextDecoder();
-    let buf = new Uint8Array(0);
-    let waiting = null; // a message whose bytes haven't all arrived yet
+    let tail = new Uint8Array(0); // the start of a JSON line still arriving
+    let waiting = null; // {msg, got}: a message whose bytes are still arriving
     const dispatch = (msg) => {
       try {
         onMessage(msg);
@@ -280,28 +305,26 @@ class Line {
       for (let chunk; !this.closed && (chunk = await this.conn.read()) !== null; ) {
         this.lastRx = Date.now();
         if (!(chunk instanceof Uint8Array)) chunk = new Uint8Array(chunk);
-        if (buf.byteLength) {
-          const b = new Uint8Array(buf.byteLength + chunk.byteLength);
-          b.set(buf);
-          b.set(chunk, buf.byteLength);
-          buf = b;
-        } else {
-          buf = chunk;
-        }
         let pos = 0;
-        while (!this.closed) {
+        while (!this.closed && pos < chunk.byteLength) {
           if (waiting) {
-            if (buf.byteLength - pos < waiting.bin) break;
-            waiting.data = buf.slice(pos, pos + waiting.bin);
-            pos += waiting.bin;
-            const msg = waiting;
+            const { msg } = waiting;
+            const n = Math.min(msg.bin - waiting.got, chunk.byteLength - pos);
+            msg.data.set(chunk.subarray(pos, pos + n), waiting.got);
+            waiting.got += n;
+            pos += n;
+            if (waiting.got < msg.bin) break;
             waiting = null;
             dispatch(msg);
             continue;
           }
-          const nl = buf.indexOf(10, pos);
-          if (nl < 0) break;
-          const raw = dec.decode(buf.subarray(pos, nl));
+          const nl = chunk.indexOf(10, pos);
+          if (nl < 0) {
+            tail = concat(tail, chunk.slice(pos)); // a copy: chunk isn't ours to keep
+            break;
+          }
+          const raw = dec.decode(concat(tail, chunk.subarray(pos, nl)));
+          tail = new Uint8Array(0);
           pos = nl + 1;
           let msg;
           try {
@@ -311,19 +334,26 @@ class Line {
           }
           if (!msg || typeof msg !== "object" || typeof msg.t !== "string") continue;
           delete msg.data;
-          if (msg.bin !== undefined) {
-            if (!Number.isInteger(msg.bin) || msg.bin < 0 || msg.bin > MAX_BIN) throw new Error("bad frame");
-            waiting = msg;
-          } else {
+          if (msg.bin === undefined) {
             dispatch(msg);
+            continue;
           }
+          if (!Number.isInteger(msg.bin) || msg.bin < 0 || msg.bin > MAX_BIN) throw new Error("bad frame");
+          msg.data = new Uint8Array(msg.bin);
+          if (msg.bin) waiting = { msg, got: 0 };
+          else dispatch(msg);
         }
-        buf = pos ? buf.slice(pos) : buf;
-        if (!waiting && buf.byteLength > MAX_LINE) break; // garbage or abuse: hang up
+        if (tail.byteLength > MAX_LINE) break; // garbage or abuse: hang up
       }
     } catch {
       // read error (or garbage): the connection is gone
     }
+    this.close();
+  }
+
+  // sendLast sends a last word, then hangs up (within a second at most).
+  async sendLast(obj) {
+    await Promise.race([this.send(obj), sleep(1000)]);
     this.close();
   }
 
@@ -425,17 +455,17 @@ export class Hub {
     return {
       send: (m) => this.handle(p, m),
       close: () => this.end(),
-      pause: () => this.pause(),
+      away: () => this.pause(),
       // The host's own files don't need to travel: hand them over as is.
       putFile: async (cid, file, onProgress) => {
-        if (file.size > this.settings.maxFile) throw Object.assign(new Error("too-big"), { refused: true });
+        if (file.size > this.settings.maxFile) throw refused("too-big");
         if (this.ended || this.peers.get(p.id) !== p) throw new Error("interrupted");
         onProgress?.(file.size);
         return JSON.parse(JSON.stringify(this.addFile(p, cid, cleanFile(file), file)));
       },
       getFile: async (id) => {
         const blob = id >= p.since ? this.files.get(id) : null;
-        if (!blob) throw Object.assign(new Error("gone"), { gone: true });
+        if (!blob) throw gone();
         return blob;
       },
     };
@@ -455,14 +485,14 @@ export class Hub {
       clearTimeout(timer);
       timer = setTimeout(() => {
         if (p) return;
-        if (denied) Promise.race([line.send({ t: "denied" }), sleep(1000)]).then(() => line.close());
+        if (denied) line.sendLast({ t: "denied" });
         else line.close();
       }, ms);
     };
     deadline(HELLO_TIMEOUT_MS, false);
     const onHello = async (m) => {
       const why = this.door(m.resume);
-      if (why) return this.turnAway(line, why);
+      if (why) return line.sendLast({ t: why });
       const ok = await this.authorized(m);
       if (line.closed || this.ended) return line.close();
       if (ok) {
@@ -472,8 +502,7 @@ export class Hub {
       }
       if (typeof m.password === "string" && ++tries >= MAX_PASSWORD_TRIES) {
         clearTimeout(timer);
-        await Promise.race([line.send({ t: "denied" }), sleep(1000)]);
-        return line.close();
+        return line.sendLast({ t: "denied" });
       }
       line.send({ t: "auth", wrong: typeof m.password === "string" });
       deadline(AUTH_TIMEOUT_MS, true);
@@ -516,11 +545,6 @@ export class Hub {
     return null;
   }
 
-  turnAway(line, why) {
-    Promise.race([line.send({ t: why }), sleep(1000)]).then(() => line.close());
-    return null;
-  }
-
   // authorized tells whether a hello may get a seat: no password needed,
   // a valid seat to take back, or the right password. Checks run one at
   // a time and each wrong one costs WRONG_PASSWORD_DELAY_MS, so guessing
@@ -545,29 +569,27 @@ export class Hub {
       return null;
     }
     const deliver = (x) => line.send(x);
-    const r = m.resume;
-    if (r && typeof r === "object" && Number.isInteger(r.id) && typeof r.token === "string") {
-      const live = this.peers.get(r.id);
-      if (live?.line && live.token === r.token) {
-        // Same guest on a new connection before we noticed the old one
-        // died (quick reload), or the same seat open in two tabs: the
-        // newest connection wins, the old one is told to stand down.
-        const old = live.line;
-        live.line = line;
-        live.deliver = deliver;
-        Promise.race([old.send({ t: "replaced" }), sleep(1000)]).then(() => old.close());
-        deliver(this.welcome(live));
-        return live;
-      }
-      const back = this.away.get(r.id);
-      if (back?.token && back.token === r.token) {
-        this.away.delete(r.id);
-        return this.attach(deliver, line, back);
-      }
+    const s = this.seatFor(m.resume);
+    if (s?.line) {
+      // Same guest on a new connection before we noticed the old one
+      // died (quick reload), or the same seat open in two tabs: the
+      // newest connection wins, the old one is told to stand down.
+      s.line.sendLast({ t: "replaced" });
+      s.line = line;
+      s.deliver = deliver;
+      deliver(this.welcome(s));
+      return s;
+    }
+    if (s) {
+      this.away.delete(s.id);
+      return this.attach(deliver, line, s);
     }
     // Checked again: things may have changed during the password check.
-    const why = this.door(r);
-    if (why) return this.turnAway(line, why);
+    const why = this.door(m.resume);
+    if (why) {
+      line.sendLast({ t: why });
+      return null;
+    }
     return this.attach(deliver, line, null);
   }
 
@@ -588,15 +610,7 @@ export class Hub {
         };
     this.peers.set(p.id, p);
     p.deliver(this.welcome(p));
-    this.broadcast(
-      {
-        t: "roster",
-        peers: this.roster(),
-        event: { kind: back ? "back" : "join", id: p.id, name: p.name },
-      },
-      p.id,
-    );
-    this.onChange();
+    this.announce(back ? "back" : "join", p, p.id);
     return p;
   }
 
@@ -606,6 +620,7 @@ export class Hub {
       proto: PROTO,
       you: { id: p.id, name: p.name, token: p.token },
       hostId: HOST_ID,
+      password: !!this.secret,
       peers: this.roster(),
       messages: this.messages.filter((m) => m.id >= p.since),
       settings: this.settings,
@@ -614,7 +629,7 @@ export class Hub {
 
   // may tells whether p is allowed to send ("chat" or "files").
   may(p, what) {
-    return p.id === HOST_ID || this.settings[what] === "all";
+    return allowed(this.settings, p.id, what);
   }
 
   uniqueName() {
@@ -683,18 +698,16 @@ export class Hub {
         if (seen === p.seen && delivered === p.delivered) return;
         p.seen = seen;
         p.delivered = delivered;
+        // No onChange: not worth a snapshot. After a reload, guests send
+        // their receipts again anyway.
         this.broadcast({ t: "receipt", from: p.id, delivered, seen }, p.id);
-        this.onChange();
         break;
       }
       case "away":
         if (p.line) this.lost(p, p.line);
         break;
-      case "lock":
-        if (p.id !== HOST_ID || !!m.on === this.settings.locked) return;
-        this.settings = { ...this.settings, locked: !!m.on };
-        this.broadcast({ t: "settings", settings: this.settings });
-        this.onChange();
+      case "set":
+        if (p.id === HOST_ID && m.settings && typeof m.settings === "object") this.setSettings(m.settings);
         break;
       case "kick":
         if (p.id === HOST_ID) this.kick(m.id);
@@ -703,6 +716,25 @@ export class Hub {
         this.drop(p);
         break;
     }
+  }
+
+  // setSettings applies the host's changes and tells everyone.
+  setSettings(changes) {
+    const old = this.settings;
+    const next = cleanSettings({ ...old, ...changes });
+    if (Object.keys(next).every((k) => next[k] === old[k])) return;
+    this.settings = next;
+    // Whoever may no longer be typing stops.
+    for (const q of this.peers.values()) {
+      if (q.typing && (!next.typing || !this.may(q, "chat"))) {
+        q.typing = false;
+        this.broadcast({ t: "typing", from: q.id, on: false }, q.id);
+      }
+    }
+    this.broadcast({ t: "settings", settings: next });
+    // Receipts back on: everyone needs to know where the others are.
+    if (next.receipts !== old.receipts) this.broadcast({ t: "roster", peers: this.roster() });
+    this.onChange();
   }
 
   // post adds a message from p to the backlog and sends it to everyone.
@@ -776,12 +808,7 @@ export class Hub {
     line.close();
     if (this.ended) return;
     this.away.set(p.id, { ...seat(p), left: Date.now() });
-    this.broadcast({
-      t: "roster",
-      peers: this.roster(),
-      event: { kind: "lost", id: p.id, name: p.name },
-    });
-    this.onChange();
+    this.announce("lost", p);
   }
 
   // kick throws a participant out, connected or not, for good.
@@ -793,15 +820,9 @@ export class Hub {
     this.away.delete(id);
     if (this.peers.get(id) === p) {
       this.peers.delete(id);
-      const line = p.line;
-      if (line) Promise.race([line.send({ t: "kicked" }), sleep(1000)]).then(() => line.close());
+      p.line?.sendLast({ t: "kicked" });
     }
-    this.broadcast({
-      t: "roster",
-      peers: this.roster(),
-      event: { kind: "kicked", id, name: p.name },
-    });
-    this.onChange();
+    this.announce("kicked", p);
   }
 
   // drop: the guest left for good.
@@ -810,12 +831,7 @@ export class Hub {
     this.peers.delete(p.id);
     p.line?.close();
     if (this.ended) return;
-    this.broadcast({
-      t: "roster",
-      peers: this.roster(),
-      event: { kind: "leave", id: p.id, name: p.name },
-    });
-    this.onChange();
+    this.announce("leave", p);
   }
 
   // tick sends heartbeats and drops guests we haven't heard from. A
@@ -828,9 +844,7 @@ export class Hub {
     if (gap > GRACE_MS) {
       // This page was frozen (phone asleep, tab in the background)
       // longer than guests keep trying: they're gone, end it for real.
-      const local = this.local;
-      this.end();
-      local?.deliver({ t: "closed", reason: "expired" });
+      this.end("expired");
       return;
     }
     // Guests give up after GRACE_MS: free their seats.
@@ -842,6 +856,12 @@ export class Hub {
       if (now - p.line.lastRx > DEAD_AFTER_MS) this.lost(p, p.line);
       else p.line.send({ t: "ping" });
     }
+  }
+
+  // announce tells everyone (but exceptId) who came or went.
+  announce(kind, p, exceptId) {
+    this.broadcast({ t: "roster", peers: this.roster(), event: { kind, id: p.id, name: p.name } }, exceptId);
+    this.onChange();
   }
 
   broadcast(m, exceptId) {
@@ -870,10 +890,13 @@ export class Hub {
   // end destroys the session: tell everyone, hang up, and stop the
   // tailcat server. The link can never be used again (as long as the
   // snapshot holding the key is thrown away too).
-  async end() {
+  // The host's own UI is told right away, with reason ("destroyed" when
+  // the host closed it, "expired" when its page slept too long).
+  async end(reason = "destroyed") {
     if (this.ended) return;
     this.ended = true;
     clearInterval(this.timer);
+    this.local?.deliver({ t: "closed", reason });
     const remotes = [...this.peers.values()].filter((p) => p.line);
     await Promise.race([
       Promise.all(remotes.map((p) => p.line.send({ t: "end" }))),
@@ -965,11 +988,14 @@ export class GuestSession {
             if (m.cid && m.from === this.resume?.id) this.settle(this.uploads, m.cid, null, m);
             break;
           case "ferr":
-            return this.settle(this.uploads, m.cid, Object.assign(new Error(m.reason), { refused: true }));
+            return this.settle(this.uploads, m.cid, refused(m.reason));
           case "fgone":
-            return this.settle(this.downloads, m.id, Object.assign(new Error("gone"), { gone: true }));
+            return this.settle(this.downloads, m.id, gone());
           case "fdata":
             return this.onData(m);
+          case "closed":
+          case "reconnecting":
+            return; // only this session makes these up, never the wire
         }
         this.onEvent(m);
       })
@@ -1035,7 +1061,7 @@ export class GuestSession {
   async putFile(cid, file, onProgress) {
     const line = this.line;
     if (!line || this.done) throw new Error("interrupted");
-    if (file.size > MAX_FILE) throw Object.assign(new Error("too-big"), { refused: true });
+    if (file.size > MAX_FILE) throw refused("too-big");
     const posted = new Promise((resolve, reject) => this.uploads.set(cid, { resolve, reject }));
     posted.catch(() => {}); // awaited below, after the sending loop
     line.send({ t: "fput", cid, name: file.name, type: file.type, size: file.size });
@@ -1077,10 +1103,7 @@ export class GuestSession {
     if (this.done) return;
     this.done = true;
     const line = this.line;
-    if (line) {
-      await Promise.race([line.send({ t: "bye" }), sleep(1000)]);
-      line.close();
-    }
+    await line?.sendLast({ t: "bye" });
     this.onEvent({ t: "closed", reason: "left" });
   }
 }

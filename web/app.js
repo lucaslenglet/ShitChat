@@ -5,7 +5,8 @@
 // core.js implements the chat protocol on top of them.
 
 import {
-  Hub, join, makeSecret, cleanSettings, HOST_ID, MAX_TEXT, MAX_FILE, PROTO, GRACE_MS, DEFAULT_SETTINGS,
+  Hub, join, makeSecret, cleanSettings, allowed,
+  HOST_ID, MAX_TEXT, MAX_FILE, MAX_PEOPLE, PROTO, GRACE_MS, DEFAULT_SETTINGS,
 } from "./core.js";
 import { randomName } from "./names.js";
 
@@ -20,29 +21,30 @@ const $ = (id) => document.getElementById(id);
 const baseURL = location.origin + location.pathname;
 
 // The tailcat address travels in the URL fragment (#tc…), which browsers
-// never send to the web server. Read it once, then wipe it from the
-// address bar and history.
-let inviteAddr = null;
-{
-  const h = decodeURIComponent(location.hash.slice(1)).trim();
-  if (h.startsWith("tc")) {
-    inviteAddr = h;
-    history.replaceState(null, "", baseURL + location.search);
-  }
+// never send to the web server. takeInviteFromHash reads it, then wipes
+// it from the address bar and history.
+function takeInviteFromHash() {
+  let h = "";
+  try {
+    h = decodeURIComponent(location.hash.slice(1)).trim();
+  } catch {} // a malformed link: as if there were none
+  if (!h.startsWith("tc")) return null;
+  history.replaceState(null, "", baseURL + location.search);
+  return h;
 }
+let inviteAddr = takeInviteFromHash();
+const linkTo = (addr) => `${baseURL}#${addr}`;
 
 const S = {
-  session: null, // {send(msg), close()} + pause() (host) or away() (guest)
+  session: null, // {send(msg), close(), away(), putFile(), getFile()}
   hub: null, // host only
   isHost: false,
   resumed: false, // picked up after a reload
   closed: false,
   authPending: false, // guest: the host asked for the password
   me: null, // {id, name, token}
-  hostId: HOST_ID,
   settings: DEFAULT_SETTINGS,
   addr: "",
-  link: "",
   peers: new Map(), // id -> {id, name, delivered, seen}
   typing: new Set(), // peer ids currently typing
   lastMsgId: 0,
@@ -57,17 +59,29 @@ const S = {
   downQueue: new Set(), // msg ids of files to fetch
   downloading: false,
   saveWhenDone: new Set(), // msg ids of files to save once fetched
+  replaying: false, // onWelcome is rendering the backlog
+  hasPassword: false, // the session needs a password on top of the link
+  starting: false, // host: creating or restoring the session (not live yet)
 };
 
 // ---------- Small helpers ----------
+function el(tag, cls, text) {
+  const x = document.createElement(tag);
+  if (cls) x.className = cls;
+  if (text !== undefined) x.textContent = text;
+  return x;
+}
+
 
 function setScreen(name) {
   document.body.dataset.screen = name;
 }
 
+// setStatus shows a note or an error under the primary button ("" hides it).
 function setStatus(text, isError = false) {
   const el = $("status");
   el.textContent = text;
+  el.hidden = !text;
   el.classList.toggle("error", isError);
 }
 
@@ -78,10 +92,8 @@ function hue(str) {
 }
 
 function avatar(name) {
-  const span = document.createElement("span");
-  span.className = "avatar";
+  const span = el("span", "avatar", name.slice(0, 1));
   span.style.setProperty("--hue", hue(name));
-  span.textContent = name.slice(0, 1);
   return span;
 }
 
@@ -207,7 +219,6 @@ async function resumable() {
 // so the build publishes only main.wasm.gz (~6.5 MB instead of ~27 MB) and
 // we decompress it here. Same approach as tailcat's own web demo.
 async function fetchWasm() {
-  const bar = $("load-progress");
   let resp = await fetch("main.wasm.gz");
   let gzipped = resp.ok;
   if (!gzipped) {
@@ -216,14 +227,17 @@ async function fetchWasm() {
   }
   const total = Number(resp.headers.get("Content-Length")) || 0;
   let loaded = 0;
+  let shown = -1;
   let body = resp.body.pipeThrough(
     new TransformStream({
       transform(chunk, ctl) {
         loaded += chunk.byteLength;
         if (total) {
-          bar.value = loaded / total;
-          const mb = (total / (1 << 20)).toFixed(1);
-          setStatus(`Loading the WireGuard engine… ${Math.floor((100 * loaded) / total)}% of ${mb} MB`);
+          const pct = Math.floor((100 * loaded) / total);
+          if (pct === shown) return ctl.enqueue(chunk);
+          shown = pct;
+          primaryBtn.style.setProperty("--p", `${pct}%`);
+          primaryBtn.textContent = `Loading… ${pct}%`;
         }
         ctl.enqueue(chunk);
       },
@@ -252,13 +266,17 @@ const advanced = $("advanced");
 
 function setFormDisabled(off) {
   primaryBtn.disabled = off;
+  primaryBtn.classList.toggle("loading", off);
+  primaryBtn.style.setProperty("--p", "0%");
   passwordInput.disabled = off;
   for (const x of advanced.querySelectorAll("input, select")) x.disabled = off;
 }
 
-function busy(text) {
+// busy shows what's going on in the primary button, plus an optional note.
+function busy(label, note = "") {
   setFormDisabled(true);
-  setStatus(text);
+  primaryBtn.textContent = label;
+  setStatus(note);
 }
 
 function failed(text) {
@@ -266,39 +284,114 @@ function failed(text) {
   setStatus(text, true);
 }
 
-// chosenSettings reads the advanced options of the home screen.
-function chosenSettings() {
-  return cleanSettings({
-    maxPeople: Number($("opt-max").value) || 0,
-    chat: $("opt-chat").value,
-    files: $("opt-files").value,
-    maxFile: Math.round((Number($("opt-maxfile").value) || 0) * (1 << 20)),
-    autoload: $("opt-autoload").value === "yes",
-    history: $("opt-history").value,
-    receipts: $("opt-receipts").value === "on",
-    typing: $("opt-typing").value === "on",
-  });
+// ---------- Session settings ----------
+// The same fields show up in the home screen's advanced options (when
+// creating a session) and in the settings sheet (during it: editable by
+// the host, read-only for guests). See cleanSettings in core.js.
+
+const MB = 1 << 20;
+const WHO = [["all", "Everyone"], ["host", "Only the host"]];
+const ON_OFF = [[true, "On"], [false, "Off"]];
+const FIELDS = [
+  { key: "locked", label: "New people", live: true, options: [[false, "Can join"], [true, "Locked out"]] },
+  { key: "maxPeople", label: "Max people", number: { min: 2, max: MAX_PEOPLE, empty: 0, placeholder: "No limit" } },
+  { key: "chat", label: "Who can write", options: WHO },
+  { key: "files", label: "Who can send files", options: WHO },
+  { key: "maxFile", label: "Max file size", number: { min: 1, max: MAX_FILE / MB, unit: MB, suffix: "MB" } },
+  { key: "autoload", label: "Received files", options: [[false, "On demand"], [true, "Automatic"]] },
+  { key: "history", label: "Newcomers see", options: [["all", "Everything"], ["none", "Only new ones"]] },
+  { key: "receipts", label: "Read receipts", options: ON_OFF },
+  { key: "typing", label: '"Is typing…"', options: ON_OFF },
+];
+
+// buildOpts fills a .opts grid with the fields; onEdit(key, value) is
+// called when one of them changes.
+function buildOpts(box, prefix, { live = false, onEdit = null } = {}) {
+  box.replaceChildren();
+  for (const f of FIELDS) {
+    if (f.live && !live) continue;
+    const id = `${prefix}-${f.key}`;
+    const label = el("label", "", f.label);
+    label.htmlFor = id;
+    let ctl;
+    if (f.options) {
+      ctl = el("select");
+      for (const [v, text] of f.options) {
+        const o = el("option", "", text);
+        o.value = String(v);
+        ctl.append(o);
+      }
+    } else {
+      ctl = el("input");
+      Object.assign(ctl, { type: "number", min: f.number.min, max: f.number.max, step: 1, inputMode: "numeric" });
+      ctl.placeholder = f.number.placeholder ?? String(f.number.max);
+    }
+    ctl.id = id;
+    ctl.dataset.key = f.key;
+    if (onEdit) ctl.onchange = () => onEdit(f.key, readField(f, ctl));
+    let cell = ctl;
+    if (f.number?.suffix) {
+      cell = el("div", "unit");
+      cell.append(ctl, el("span", "", f.number.suffix));
+    }
+    box.append(label, cell);
+  }
 }
+
+function readField(f, ctl) {
+  if (f.options) return f.options.find(([v]) => String(v) === ctl.value)?.[0];
+  const n = Number(ctl.value);
+  if (!ctl.value || !Number.isFinite(n)) return f.number.empty ?? 0;
+  return Math.round(n * (f.number.unit ?? 1));
+}
+
+function readOpts(box) {
+  const s = {};
+  for (const f of FIELDS) {
+    const ctl = box.querySelector(`[data-key="${f.key}"]`);
+    if (ctl) s[f.key] = readField(f, ctl);
+  }
+  return cleanSettings(s);
+}
+
+function fillOpts(box, s) {
+  for (const f of FIELDS) {
+    const ctl = box.querySelector(`[data-key="${f.key}"]`);
+    if (!ctl) continue;
+    if (f.options) ctl.value = String(s[f.key]);
+    else ctl.value = s[f.key] === f.number.empty ? "" : String(s[f.key] / (f.number.unit ?? 1));
+  }
+}
+
+// describe says what a setting is set to, in words.
+function describe(key, s) {
+  const f = FIELDS.find((x) => x.key === key);
+  if (key === "maxPeople") return s.maxPeople ? String(s.maxPeople) : "no limit";
+  if (key === "maxFile") return fmtSize(s.maxFile);
+  return (f.options.find(([v]) => v === s[key])?.[1] ?? String(s[key])).toLowerCase();
+}
+
+const homeOpts = $("home-opts");
+buildOpts(homeOpts, "opt");
 
 // hostSession creates a session, or resumes the saved one after a reload.
 async function hostSession(saved = null) {
   busy(saved ? "Restoring your session…" : "Creating the session…");
+  S.starting = true;
   let hub = null;
   try {
     const password = saved ? "" : passwordInput.value;
     const secret = password ? await makeSecret(password) : null;
-    const settings = saved ? null : chosenSettings();
+    const settings = saved ? null : readOpts(homeOpts);
     hub = new Hub({ makeName: randomName, snapshot: saved?.hub, secret, settings, onChange: saveHostSoon });
     const addr = await hub.listen(globalThis.tailcatListen, { derpMapURL, verbose });
     S.isHost = true;
     S.resumed = !!saved;
     S.hub = hub;
     S.addr = addr;
-    S.link = `${baseURL}#${addr}`;
     saveHost();
     S.session = hub.openLocal(onEvent);
     passwordInput.value = "";
-    $("invite").hidden = !!saved;
   } catch (err) {
     hub?.end();
     forget();
@@ -308,20 +401,20 @@ async function hostSession(saved = null) {
     passwordInput.hidden = false;
     advanced.hidden = false;
     failed(`Couldn't ${saved ? "restore" : "create"} the session: ${err.message}`);
+  } finally {
+    S.starting = false;
   }
 }
 
 // joinSession joins inviteAddr, or takes our seat back after a reload.
 async function joinSession(resume = null) {
   busy(
-    resume
-      ? "Reconnecting to the session…"
-      : "Connecting to the session… (if it no longer exists, this fails after a minute)",
+    resume ? "Reconnecting…" : "Connecting…",
+    resume ? "" : "If the session no longer exists, this fails after a minute.",
   );
   try {
     S.resumed = !!resume;
     S.addr = inviteAddr;
-    S.link = `${baseURL}#${inviteAddr}`;
     S.session = await join(
       globalThis.tailcatDial,
       { addr: inviteAddr, derpMapURL, verbose, resume },
@@ -343,15 +436,14 @@ $("start").onsubmit = (e) => {
 // askPassword: the host wants a password before letting us in.
 function askPassword(wrong) {
   S.authPending = true;
+  setFormDisabled(false);
   passwordInput.hidden = false;
-  passwordInput.disabled = false;
   advanced.hidden = true;
   passwordInput.required = true;
   passwordInput.placeholder = "Password";
   passwordInput.setAttribute("aria-label", "Password");
   passwordInput.autocomplete = "current-password";
   primaryBtn.textContent = "Join";
-  primaryBtn.disabled = false;
   setStatus(wrong ? "Wrong password, try again." : "This session is protected by a password.", wrong);
   setScreen("home");
   passwordInput.value = "";
@@ -405,7 +497,7 @@ function onWelcome(m) {
   if (m.proto !== PROTO) console.warn("shitchat: protocol mismatch", m.proto, PROTO);
   const first = !S.me;
   S.me = m.you;
-  S.hostId = m.hostId;
+  S.hasPassword = !!m.password;
   S.settings = cleanSettings(m.settings);
   applySettings();
   if (!S.isHost) save({ role: "guest", addr: S.addr, resume: { id: m.you.id, token: m.you.token } });
@@ -413,19 +505,25 @@ function onWelcome(m) {
   S.typing.clear();
   // Messages typed while disconnected (or lost in the cut) that the hub
   // never got: send them again below.
-  const unsent = [...S.pending].filter(
-    ([cid]) => !m.messages.some((x) => x.cid === cid && x.from === m.you.id),
-  );
+  const echoed = new Map(m.messages.filter((x) => x.cid && x.from === m.you.id).map((x) => [x.cid, x]));
+  const unsent = [];
   for (const [cid, li] of S.pending) {
-    const done = li._local && m.messages.find((x) => x.cid === cid && x.from === m.you.id);
-    if (done && !S.blobs.has(done.id)) S.blobs.set(done.id, li._local);
+    const done = echoed.get(cid);
+    if (!done) unsent.push([cid, li]);
+    else if (li._local && !S.blobs.has(done.id)) S.blobs.set(done.id, li._local);
   }
   S.pending.clear();
   S.mine.clear();
   S.lastMsgId = 0;
   S.sentReceipt = { delivered: 0, seen: 0 };
   $("messages").replaceChildren();
-  for (const msg of m.messages) renderMsg(msg);
+  // Ticks and scrolling are done once, below, not per message.
+  S.replaying = true;
+  try {
+    for (const msg of m.messages) renderMsg(msg);
+  } finally {
+    S.replaying = false;
+  }
   if (!first || S.resumed) {
     system(S.isHost ? `Session restored. You are still ${S.me.name}.` : `Reconnected. You are ${S.me.name}.`);
   } else {
@@ -444,13 +542,13 @@ function onWelcome(m) {
     if (li._file) {
       if (!S.upQueue.includes(cid)) S.upQueue.push(cid);
     } else {
-      S.session?.send({ t: "msg", text: li.querySelector(".text").textContent, cid });
+      S.session?.send({ t: "msg", text: li._text, cid });
     }
   }
   pumpUploads();
   pumpDownloads();
-  $("conn").hidden = true;
-  $("invite-link").value = S.link;
+  setOffline(false);
+  $("invite-link").value = linkTo(S.addr);
   $("leave-btn").textContent = S.isHost ? "Destroy" : "Leave";
   setScreen("chat");
   renderRoster();
@@ -458,25 +556,34 @@ function onWelcome(m) {
   refreshTicks();
   sendReceipts();
   scrollToBottom(true);
-  if (first) $("input").focus();
+  if (first && S.isHost && !S.resumed) openInvite();
+  else if (first) $("input").focus();
 }
 
-const may = (what) => S.me?.id === S.hostId || S.settings[what] === "all";
-const amHost = () => !!S.me && S.me.id === S.hostId;
+const amHost = () => S.me?.id === HOST_ID;
+const may = (what) => !!S.me && allowed(S.settings, S.me.id, what);
 
 // applySettings adapts the page to what the host allows.
 function applySettings() {
   const locked = S.settings.locked;
-  $("locked-pill").hidden = !locked;
-  $("door").hidden = !amHost();
-  // The invite text (open / needs the password) makes no sense while locked.
-  const secret = !!S.hub?.secret;
+  const host = amHost();
+  fillOpts(liveOpts, S.settings);
+  for (const c of liveOpts.querySelectorAll("input, select")) c.disabled = !host;
+  $("settings-note").textContent = host
+    ? "Changes apply right away, and everyone is told."
+    : "Set by the host. You'll be told when they change something.";
+  // The host sees the state on the lock button itself.
+  $("locked-pill").hidden = !locked || host;
+  const lock = $("lock-btn");
+  lock.hidden = !host;
+  lock.textContent = locked ? "🔒" : "🔓";
+  lock.classList.toggle("on", locked);
+  lock.title = locked ? "Locked: nobody new can join. Tap to unlock." : "Open: tap to lock the session.";
+  lock.setAttribute("aria-label", locked ? "Unlock the session" : "Lock the session");
+  const secret = S.hasPassword;
   $("invite-open").hidden = locked || secret;
   $("invite-locked").hidden = locked || !secret;
-  $("door-text").textContent = locked
-    ? "🔒 Locked: the link lets nobody new in."
-    : "🔓 Open: anyone with the link can join.";
-  $("lock-btn").textContent = locked ? "Unlock" : "Lock";
+  $("invite-shut").hidden = !locked;
   const chat = may("chat");
   input.disabled = !chat;
   $("send-btn").disabled = !chat;
@@ -489,7 +596,7 @@ function applySettings() {
 // settingsNotes describes the session's rules, for the first welcome.
 function settingsNotes() {
   const s = S.settings;
-  const host = S.me.id === S.hostId;
+  const host = amHost();
   const notes = [];
   if (s.maxPeople) notes.push(`This session is limited to ${s.maxPeople} people.`);
   if (s.chat === "host") notes.push(host ? "Only you can write in this session." : "Only the host can write in this session.");
@@ -509,10 +616,15 @@ function onReconnecting(m) {
   S.typing.clear();
   renderTyping();
   if (!S.me) return; // resuming after a reload: the home screen shows the status
-  const until = fmtTime(m.until);
-  const el = $("conn");
-  el.textContent = `Lost the connection to the host. Reconnecting… (giving up at ${until})`;
-  el.hidden = false;
+  $("conn-sub").textContent =
+    `The host is unreachable. What you write is sent when they're back (until ${fmtTime(m.until)}).`;
+  setOffline(true);
+}
+
+// setOffline shows (or hides) that the host can't be reached right now.
+function setOffline(on) {
+  $("conn").hidden = !on;
+  $("chat").classList.toggle("offline", on);
 }
 
 const ROSTER_VERBS = {
@@ -525,23 +637,36 @@ const ROSTER_VERBS = {
 
 function onRoster(m) {
   setPeers(m.peers);
-  if (m.event) system(`${m.event.name} ${ROSTER_VERBS[m.event.kind] ?? "left"}.`);
+  if (m.event) system(`${m.event.name} ${(Object.hasOwn(ROSTER_VERBS, m.event.kind) ? ROSTER_VERBS[m.event.kind] : "left")}.`);
   renderRoster();
   renderTyping();
   refreshTicks();
 }
 
 function onSettings(m) {
-  const was = S.settings.locked;
-  S.settings = cleanSettings(m.settings);
+  const old = S.settings;
+  const s = cleanSettings(m.settings);
+  S.settings = s;
   applySettings();
-  if (S.settings.locked !== was) {
+  const who = amHost() ? "You" : "The host";
+  if (s.locked !== old.locked) {
     system(
-      S.settings.locked
-        ? "The session is now locked: nobody new can join."
-        : "The session is open again: anyone with the link can join.",
+      s.locked
+        ? `${who} locked the session: nobody new can join.`
+        : `${who} unlocked the session: anyone with the link can join.`,
     );
   }
+  const changed = FIELDS.filter((f) => f.key !== "locked" && s[f.key] !== old[f.key]);
+  if (changed.length) {
+    const what = changed.map((f) => `${f.label} → ${describe(f.key, s)}`).join(", ");
+    system(`${who} changed the settings: ${what}.`);
+  }
+  if (!s.typing) {
+    S.typing.clear();
+    renderTyping();
+  }
+  if (s.receipts && !old.receipts) sendReceipts();
+  refreshTicks();
 }
 
 function onMsg(m) {
@@ -569,40 +694,39 @@ function onReceipt(m) {
   refreshTicks();
 }
 
+const ENDINGS = {
+  destroyed: ["Session destroyed", "You destroyed the session. The messages are gone and the link is dead."],
+  ended: ["Session destroyed", "The host ended the session. The messages are gone and the link is dead."],
+  left: ["You left", "You left the session. The messages are gone from this tab."],
+  replaced: ["Opened elsewhere", "This session was picked up in another tab, so this one stepped aside."],
+  denied: [
+    "Access denied",
+    "Too many wrong passwords, or it took too long to type one. Open the link again to retry.",
+  ],
+  kicked: ["Removed", "The host removed you from the session. The messages are gone from this tab."],
+  locked: [
+    "Session locked",
+    "The host isn't letting anyone new in right now. Ask them to unlock it, then open the link again.",
+  ],
+  full: [
+    "Session full",
+    "This session has reached the number of people its host allowed. Ask them to make room, then open the link again.",
+  ],
+  expired: [
+    "Session expired",
+    "This page was asleep for too long and the guests gave up, so the session was destroyed. The link is dead.",
+  ],
+};
+
 function onClosed(reason) {
-  if (reason === "ended") {
-    showEnded("Session destroyed", "The host ended the session. The messages are gone and the link is dead.");
-  } else if (reason === "left") {
-    showEnded("You left", "You left the session. The messages are gone from this tab.");
-  } else if (reason === "replaced") {
-    showEnded("Opened elsewhere", "This session was picked up in another tab, so this one stepped aside.");
-  } else if (reason === "denied") {
-    showEnded(
-      "Access denied",
-      "Too many wrong passwords, or it took too long to type one. Open the link again to retry.",
-    );
-  } else if (reason === "kicked") {
-    showEnded("Removed", "The host removed you from the session. The messages are gone from this tab.");
-  } else if (reason === "locked") {
-    showEnded("Session locked", "The host isn't letting anyone new in right now. Ask them to unlock it, then open the link again.");
-  } else if (reason === "full") {
-    showEnded(
-      "Session full",
-      "This session has reached the number of people its host allowed. Ask them to make room, then open the link again.",
-    );
-  } else if (reason === "expired") {
-    showEnded(
-      "Session expired",
-      "This page was asleep for too long and the guests gave up, so the session was destroyed. The link is dead.",
-    );
-  } else {
-    showEnded(
+  showEnded(
+    ...((Object.hasOwn(ENDINGS, reason) && ENDINGS[reason]) || [
       "Session over",
       S.me
         ? "Lost contact with the host for too long: they probably closed their tab, so the session no longer exists."
         : "Couldn't get back to the session: the host probably closed their tab, so it no longer exists.",
-    );
-  }
+    ]),
+  );
 }
 
 function showEnded(title, text) {
@@ -610,11 +734,11 @@ function showEnded(title, text) {
   S.session = null;
   S.hub = null;
   forget();
-  $("conn").hidden = true;
+  setOffline(false);
   S.peers.clear();
   S.pending.clear();
   S.mine.clear();
-  if (viewer.open) viewer.close();
+  for (const d of document.querySelectorAll("dialog[open]")) d.close();
   for (const e of S.blobs.values()) URL.revokeObjectURL(e.url);
   S.blobs.clear();
   S.gone.clear();
@@ -642,60 +766,37 @@ function scrollToBottom(force) {
 
 function system(text) {
   const stick = nearBottom();
-  const li = document.createElement("li");
-  li.className = "system";
-  li.textContent = text;
-  $("messages").append(li);
+  $("messages").append(el("li", "system", text));
   scrollToBottom(stick);
 }
 
 function buildMsg({ mine, from, name, text, file }) {
-  const li = document.createElement("li");
-  li.className = `msg ${mine ? "mine" : "theirs"}`;
+  const li = el("li", `msg ${mine ? "mine" : "theirs"}`);
   li.dataset.from = from;
   li.style.setProperty("--hue", hue(name));
-
-  const author = document.createElement("div");
-  author.className = "author";
-  author.textContent = name;
-
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
-  let p;
-  if (file) {
-    bubble.classList.add("has-file");
-    p = document.createElement("div");
-    p.className = "att";
-    li._meta = file;
-  } else {
-    p = document.createElement("p");
-    p.className = "text";
-    p.textContent = text;
-  }
-  const meta = document.createElement("span");
-  meta.className = "meta";
-  const time = document.createElement("time");
-  const ticks = document.createElement("span");
-  ticks.className = "ticks";
-  meta.append(time, ticks);
-  bubble.append(p, meta);
-
-  const receipt = document.createElement("div");
-  receipt.className = "receipt";
-
-  li.append(author, bubble, receipt);
+  const bubble = el("div", file ? "bubble has-file" : "bubble");
+  if (file) li._meta = file;
+  else li._text = text;
+  // Kept on the <li>: refreshTicks touches them on every receipt.
+  li._time = el("time");
+  li._ticks = el("span", "ticks");
+  li._receipt = el("div", "receipt");
+  const meta = el("span", "meta");
+  meta.append(li._time, li._ticks);
+  bubble.append(file ? el("div", "att") : el("p", "text", text), meta);
+  li.append(el("div", "author", name), bubble, li._receipt);
   return li;
 }
 
 function appendMsg(li, from, force) {
   const list = $("messages");
-  const stick = force || nearBottom();
+  const stick = force || (!S.replaying && nearBottom());
   const prev = list.lastElementChild;
   if (prev && prev.classList.contains("msg") && prev.dataset.from === String(from)) {
     li.classList.add("cont");
   }
   list.append(li);
-  scrollToBottom(stick);
+  if (!S.replaying) scrollToBottom(stick);
 }
 
 function renderMsg(m) {
@@ -715,11 +816,11 @@ function renderMsg(m) {
     if (S.settings.autoload) wantFile(m.id);
     paintAtt(li);
   }
-  li.querySelector("time").textContent = fmtTime(m.ts);
+  li._time.textContent = fmtTime(m.ts);
   S.lastMsgId = Math.max(S.lastMsgId, m.id);
   if (mine) {
     S.mine.set(m.id, li);
-    refreshTicks();
+    if (!S.replaying) refreshTicks();
   }
 }
 
@@ -743,11 +844,14 @@ function refreshTicks() {
   for (const id of S.mine.keys()) lastId = Math.max(lastId, id);
   for (const [id, li] of S.mine) {
     const st = S.settings.receipts ? statusFor(id, others) : { ticks: "✓", cls: "sent", label: "Sent" };
-    const t = li.querySelector(".ticks");
-    t.textContent = st.ticks;
-    t.className = `ticks ${st.cls}`;
-    t.title = st.label;
-    li.querySelector(".receipt").textContent = id === lastId && S.settings.receipts ? st.label : "";
+    const receipt = id === lastId && S.settings.receipts ? st.label : "";
+    const key = `${st.cls} ${st.label} ${receipt}`;
+    if (li._tickKey === key) continue;
+    li._tickKey = key;
+    li._ticks.textContent = st.ticks;
+    li._ticks.className = `ticks ${st.cls}`;
+    li._ticks.title = st.label;
+    li._receipt.textContent = receipt;
   }
 }
 
@@ -755,18 +859,12 @@ function renderRoster() {
   const ul = $("roster");
   ul.replaceChildren();
   for (const p of S.peers.values()) {
-    const li = document.createElement("li");
-    if (p.id === S.me.id) li.className = "me";
+    const li = el("li", p.id === S.me.id ? "me" : "");
     li.append(avatar(p.name), p.name);
     const tags = [];
     if (p.id === S.me.id) tags.push("you");
-    if (p.id === S.hostId) tags.push("host");
-    if (tags.length) {
-      const b = document.createElement("span");
-      b.className = "badge";
-      b.textContent = `(${tags.join(", ")})`;
-      li.append(b);
-    }
+    if (p.id === HOST_ID) tags.push("host");
+    if (tags.length) li.append(el("span", "badge", `(${tags.join(", ")})`));
     if (amHost() && p.id !== S.me.id) {
       const x = el("button", "kick", "✕");
       x.type = "button";
@@ -828,18 +926,20 @@ const share = (e) => navigator.share({ files: [shareable(e)] }).catch(() => {});
 
 const findMsg = (id) => $("messages").querySelector(`li[data-id="${id}"]`);
 
-function el(tag, cls, text) {
-  const x = document.createElement(tag);
-  if (cls) x.className = cls;
-  if (text !== undefined) x.textContent = text;
-  return x;
-}
-
 function saveLink(e) {
   const a = el("a", "btn small", "Save");
   a.href = e.url;
   a.download = e.name;
   return a;
+}
+
+// attState tells where a file message's attachment stands.
+function attState(li, id, entry) {
+  if (li._failed) return "failed";
+  if (li.classList.contains("pending")) return "sending";
+  if (entry) return "ready";
+  if (S.gone.has(id)) return "gone";
+  return S.downQueue.has(id) ? "receiving" : "idle";
 }
 
 // paintAtt (re)draws a file message's attachment for its current state.
@@ -848,19 +948,8 @@ function paintAtt(li) {
   if (!box) return;
   const meta = li._meta;
   const id = Number(li.dataset.id) || 0;
-  const pending = li.classList.contains("pending");
   const entry = (id && S.blobs.get(id)) || li._local || null;
-  const state = li._failed
-    ? "failed"
-    : pending
-      ? "sending"
-      : entry
-        ? "ready"
-        : S.gone.has(id)
-          ? "gone"
-          : S.downQueue.has(id)
-            ? "receiving"
-            : "idle";
+  const state = attState(li, id, entry);
   const key = `${state} ${entry?.url ?? ""} ${entry?.kind ?? ""}`;
   if (box.dataset.key === key) return;
   box.dataset.key = key;
@@ -907,8 +996,8 @@ function paintAtt(li) {
   label.append(fname, el("span", "filesize", fmtSize(meta.size)));
   info.append(label);
   bar.append(info);
+  const actions = el("div", "fileactions");
   if (state === "ready") {
-    const actions = el("div", "fileactions");
     actions.append(saveLink(entry));
     if (!media && canShare(entry)) {
       const b = el("button", "btn small", "Share");
@@ -916,23 +1005,21 @@ function paintAtt(li) {
       b.onclick = () => share(entry);
       actions.append(b);
     }
-    bar.append(actions);
   } else if (state === "idle") {
     // Not fetched yet: a photo or video shows up in the chat once
     // loaded, any other file is saved right away.
-    const media = kindOf(meta.type) !== "file";
-    const b = el("button", "btn small", media ? "Load" : "Download");
+    const showable = kindOf(meta.type) !== "file";
+    const b = el("button", "btn small", showable ? "Load" : "Download");
     b.type = "button";
-    b.title = media ? `Show ${meta.name} in the chat` : `Download ${meta.name}`;
+    b.title = showable ? `Show ${meta.name} in the chat` : `Download ${meta.name}`;
     b.onclick = () => {
-      if (!media) S.saveWhenDone.add(id);
+      if (!showable) S.saveWhenDone.add(id);
       wantFile(id);
       paintAtt(li);
     };
-    const actions = el("div", "fileactions");
     actions.append(b);
-    bar.append(actions);
   }
+  if (actions.childElementCount) bar.append(actions);
   box.append(bar);
 
   if (state === "sending" || state === "receiving") {
@@ -940,8 +1027,9 @@ function paintAtt(li) {
     const prog = el("progress");
     prog.max = 1;
     prog.value = 0;
-    st.append(prog, el("span", "pct", state === "sending" ? "Sending…" : "Receiving…"));
-    st.dataset.verb = state === "sending" ? "Sending" : "Receiving";
+    const verb = state === "sending" ? "Sending" : "Receiving";
+    st.append(prog, el("span", "pct", `${verb}…`));
+    st.dataset.verb = verb;
     box.append(st);
   } else if (state === "gone") {
     box.append(el("div", "att-status note-text", "No longer available (the host reloaded)."));
@@ -950,12 +1038,27 @@ function paintAtt(li) {
   }
 }
 
+// setProgress runs for every piece of a file: it only touches the page
+// when the percentage changes.
 function setProgress(li, n) {
   const st = li?.querySelector(".att-status");
   if (!st?.dataset.verb) return;
-  const size = li._meta.size || 1;
-  st.querySelector("progress").value = n / size;
-  st.querySelector(".pct").textContent = `${st.dataset.verb} ${Math.floor((100 * n) / size)}%`;
+  const pct = Math.floor((100 * n) / (li._meta.size || 1));
+  if (st._pct === pct) return;
+  st._pct = pct;
+  st.querySelector("progress").value = pct / 100;
+  st.querySelector(".pct").textContent = `${st.dataset.verb} ${pct}%`;
+}
+
+// addPending shows one of my messages ({text} or {file}) until the hub
+// echoes it back.
+function addPending(cid, content) {
+  const li = buildMsg({ mine: true, from: S.me.id, name: S.me.name, ...content });
+  li.classList.add("pending");
+  li._ticks.textContent = "🕓";
+  S.pending.set(cid, li);
+  appendMsg(li, S.me.id, true);
+  return li;
 }
 
 function sendFiles(files) {
@@ -971,13 +1074,9 @@ function sendFiles(files) {
     }
     const cid = newCid();
     const meta = { name: file.name || "file", type: (file.type || "").toLowerCase(), size: file.size };
-    const li = buildMsg({ mine: true, from: S.me.id, name: S.me.name, file: meta });
+    const li = addPending(cid, { file: meta });
     li._file = file;
     li._local = fileEntry(file, meta);
-    li.classList.add("pending");
-    li.querySelector(".ticks").textContent = "🕓";
-    S.pending.set(cid, li);
-    appendMsg(li, S.me.id, true);
     paintAtt(li);
     S.upQueue.push(cid);
   }
@@ -1006,7 +1105,7 @@ async function pumpUploads() {
         S.pending.delete(cid);
         li._failed = { "too-big": "too big", "not-allowed": "only the host can send files" }[err.message] ?? err.message;
         li.classList.remove("pending");
-        li.querySelector(".ticks").textContent = "⚠️";
+        li._ticks.textContent = "⚠️";
         paintAtt(li);
       }
     }
@@ -1028,13 +1127,17 @@ async function pumpDownloads() {
   try {
     for (const id of S.downQueue) {
       if (!S.session || S.closed) break;
-      const meta = findMsg(id)?._meta;
+      let li = findMsg(id);
+      const meta = li?._meta;
       if (!meta || S.blobs.has(id)) {
         S.downQueue.delete(id);
         continue;
       }
       try {
-        const blob = await S.session.getFile(id, meta, (n) => setProgress(findMsg(id), n));
+        const blob = await S.session.getFile(id, meta, (n) => {
+          if (!li?.isConnected) li = findMsg(id); // re-rendered by a welcome
+          setProgress(li, n);
+        });
         if (S.closed) break;
         S.downQueue.delete(id);
         const entry = fileEntry(blob, meta);
@@ -1046,7 +1149,7 @@ async function pumpDownloads() {
         S.saveWhenDone.delete(id);
         S.gone.add(id);
       }
-      const li = findMsg(id);
+      li = findMsg(id);
       if (li) paintAtt(li);
     }
   } finally {
@@ -1194,65 +1297,117 @@ function sendMessage() {
   const text = input.value.slice(0, MAX_TEXT);
   if (!text.trim() || !S.session) return;
   const cid = newCid();
-  const li = buildMsg({ mine: true, from: S.me.id, name: S.me.name, text });
-  li.classList.add("pending");
-  li.querySelector(".ticks").textContent = "🕓";
-  S.pending.set(cid, li);
-  appendMsg(li, S.me.id, true);
+  addPending(cid, { text });
   S.session.send({ t: "msg", text, cid });
-  // The hub clears our typing flag when the message arrives.
-  clearTimeout(typingIdle);
-  typingOn = false;
+  stopTyping(false); // the hub clears our typing flag when the message arrives
   input.value = "";
   autosize();
 }
 
-// ---------- Invite / leave ----------
+// ---------- Sheets: settings and invite ----------
 
-$("lock-btn").onclick = () => S.session?.send({ t: "lock", on: !S.settings.locked });
+// Every sheet closes on a tap on its backdrop or on a [data-close] button.
+// A press that starts inside (selecting the link…) and ends outside doesn't count.
+for (const d of document.querySelectorAll("dialog.sheet")) {
+  let downOnBackdrop = false;
+  d.onpointerdown = (e) => (downOnBackdrop = e.target === d);
+  d.onclick = (e) => {
+    if ((e.target === d && downOnBackdrop) || e.target.closest("[data-close]")) d.close();
+  };
+}
 
-$("invite-btn").onclick = () => {
-  $("invite").hidden = !$("invite").hidden;
+function openSheet(d) {
+  if (!d.open) d.showModal();
+}
+
+// changeSettings: the host changes some settings (the hub tells everyone).
+function changeSettings(changes) {
+  if (!amHost() || !S.session) return;
+  // Show the cleaned-up value right away (e.g. 1 person becomes 2).
+  fillOpts(liveOpts, cleanSettings({ ...S.settings, ...changes }));
+  S.session.send({ t: "set", settings: changes });
+}
+
+$("lock-btn").onclick = () => changeSettings({ locked: !S.settings.locked });
+
+const settingsSheet = $("settings");
+const liveOpts = $("live-opts");
+buildOpts(liveOpts, "live", { live: true, onEdit: (key, value) => changeSettings({ [key]: value }) });
+
+$("settings-btn").onclick = () => {
+  fillOpts(liveOpts, S.settings);
+  openSheet(settingsSheet);
 };
+
+const inviteSheet = $("invite");
+const openInvite = () => openSheet(inviteSheet);
+$("invite-btn").onclick = openInvite;
+inviteSheet.addEventListener("close", () => {
+  if (S.me && !S.closed && !input.disabled && matchMedia("(pointer: fine)").matches) input.focus();
+});
+$("invite-link").onclick = (e) => e.target.select();
 
 $("copy-btn").onclick = async () => {
   const btn = $("copy-btn");
   try {
-    await navigator.clipboard.writeText(S.link);
+    await navigator.clipboard.writeText(linkTo(S.addr));
   } catch {
     $("invite-link").select();
     document.execCommand?.("copy");
   }
-  btn.textContent = "Copied!";
-  setTimeout(() => (btn.textContent = "Copy"), 1500);
+  btn.textContent = "Copied ✓";
+  setTimeout(() => (btn.textContent = "Copy the link"), 1500);
 };
 
 if (navigator.share) {
+  // On phones, sharing is the main way: copying comes second.
   $("share-btn").hidden = false;
+  $("copy-btn").classList.remove("primary");
   $("share-btn").onclick = () =>
     navigator
       .share({
         title: "ShitChat",
         text: "Join my ShitChat session (it self-destructs when I leave):",
-        url: S.link,
+        url: linkTo(S.addr),
       })
       .catch(() => {});
 }
 
+// ---------- Leaving ----------
+
 $("leave-btn").onclick = async () => {
   if (!S.session) return;
-  if (S.isHost) {
+  const ok =
+    !S.isHost ||
+    confirm("Destroy the session? Everyone will be disconnected and the link will never work again.");
+  // Fires a "closed" event ("destroyed" for the host, "left" for a guest).
+  if (ok) await S.session.close();
+};
+
+// Pasting another invite link in the address bar only changes the
+// fragment: the page doesn't reload by itself. Leave the current session
+// (after asking), then reload to join the new one.
+window.addEventListener("hashchange", async () => {
+  const h = takeInviteFromHash();
+  if (!h) return;
+  if (S.starting || (S.session && !S.closed)) {
+    if (h === S.addr) return; // that's this very session
     const ok = confirm(
-      "Destroy the session? Everyone will be disconnected and the link will never work again.",
+      S.isHost || S.starting
+        ? "Join the other session? Yours will be destroyed: everyone is disconnected and its link dies."
+        : "Leave this session and join the other one?",
     );
     if (!ok) return;
+    // Still starting: nothing to close, the reload stops it all.
     const s = S.session;
-    showEnded("Session destroyed", "You destroyed the session. The messages are gone and the link is dead.");
-    await s.close();
-  } else {
-    await S.session.close(); // fires a "closed: left" event
+    S.session = null;
+    S.closed = true;
+    if (s) await Promise.race([s.close(), new Promise((r) => setTimeout(r, 2000))]);
   }
-};
+  forget();
+  history.replaceState(null, "", `${baseURL}${location.search}#${encodeURIComponent(h)}`);
+  location.reload();
+});
 
 // Closing the host's tab destroys the session: ask first.
 window.addEventListener("beforeunload", (e) => {
@@ -1267,18 +1422,12 @@ window.addEventListener("beforeunload", (e) => {
 // the others so they reconnect right away.
 window.addEventListener("pagehide", () => {
   if (!S.session || S.closed) return;
-  if (S.isHost) {
-    saveHost();
-    S.session.pause();
-  } else {
-    S.session.away();
-  }
+  if (S.isHost) saveHost();
+  S.session.away();
   touch();
 });
 
 // ---------- Go ----------
-
-$("camera-btn").hidden = !matchMedia("(pointer: coarse)").matches;
 
 if (inviteAddr) {
   $("invite-note").hidden = false;
@@ -1292,10 +1441,11 @@ const savedSession = resumable();
 try {
   await bootWasm();
 } catch (err) {
+  primaryBtn.classList.remove("loading");
+  primaryBtn.textContent = "Unavailable";
   setStatus(`Couldn't load the WebAssembly engine: ${err.message}`, true);
   throw err;
 }
-$("load-progress").hidden = true;
 
 const saved = await savedSession;
 if (saved) advanced.hidden = true;
@@ -1308,5 +1458,5 @@ if (saved?.role === "host") {
   joinSession();
 } else {
   setFormDisabled(false);
-  setStatus("Ready.");
+  primaryBtn.textContent = "Create a session";
 }

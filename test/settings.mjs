@@ -218,7 +218,7 @@ try {
   ok(!I.events.some((m) => m.t === "typing" || m.t === "receipt"), "typing and receipts are dropped when off");
 
   // ---- Lock and kick ----
-  host3.send({ t: "lock", on: true });
+  host3.send({ t: "set", settings: { locked: true } });
   const lk = await G.wait((m) => m.t === "settings");
   ok(lk.settings.locked, "everyone is told the session is locked");
   const J = recorder("J");
@@ -242,11 +242,35 @@ try {
   const G3 = recorder("G3");
   await join(tailcatDial, { addr: addr3, resume: seatG }, G3);
   ok((await G3.wait((m) => m.t === "closed")).reason === "kicked", "a kicked seat can't be taken back");
-  host3.send({ t: "lock", on: false });
+  host3.send({ t: "set", settings: { locked: false } });
   const K = recorder("K");
-  await join(tailcatDial, { addr: addr3 }, K);
+  const k = await join(tailcatDial, { addr: addr3 }, K);
   await K.wait((m) => m.t === "welcome");
   ok(true, "unlocked: newcomers get in again");
+
+  // ---- Changing the settings during the session ----
+  i.send({ t: "set", settings: { chat: "host" } });
+  await sleep(100);
+  ok(hub3.settings.chat === "all", "a guest can't change the settings");
+  host3.send({ t: "set", settings: { typing: true } });
+  await K.wait((m) => m.t === "settings" && m.settings.typing);
+  k.send({ t: "typing", on: true });
+  await I.wait((m) => m.t === "typing" && m.on);
+  host3.send({ t: "set", settings: { chat: "host", maxPeople: 1, bogus: 1 } });
+  const st = await K.wait((m) => m.t === "settings" && m.settings.chat === "host");
+  ok(st.settings.maxPeople === 2 && !("bogus" in st.settings), "changes are sanitized and sent to everyone");
+  await I.wait((m) => m.t === "typing" && !m.on);
+  ok(true, "whoever may no longer write stops typing");
+  k.send({ t: "msg", text: "nope", cid: "kn" });
+  await sleep(100);
+  ok(!I.events.some((m) => m.t === "msg" && m.cid === "kn"), "the new rules apply right away");
+  const before = K.events.filter((m) => m.t === "settings").length;
+  host3.send({ t: "set", settings: { chat: "host" } });
+  await sleep(100);
+  ok(K.events.filter((m) => m.t === "settings").length === before, "a no-op change isn't broadcast");
+  host3.send({ t: "set", settings: { receipts: true } });
+  await K.wait((m) => m.t === "roster" && !m.event);
+  ok(true, "receipts back on: everyone gets the roster again");
   const snap3 = JSON.parse(JSON.stringify(hub3.snapshot()));
   ok(snap3.kicked.includes(seatG.id), "kicked ids are in the snapshot");
   await host3.close();

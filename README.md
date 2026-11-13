@@ -45,10 +45,14 @@ can write / send files" never restricts the host itself.
   ones* (what's posted after they joined, files included).
 - **Read receipts** and **"Is typing…"**: on or off, for everyone.
 
-And during the session, the host can:
+During the session, **⚙️** (top left) shows the current settings to everyone.
+The host can change any of them there, and everyone gets a note in the chat
+saying what changed. A change applies from then on: lowering the max people
+throws nobody out, and the history setting only concerns the next newcomers.
+The host can also:
 
-- **Lock** the session (in the Invite panel): the link lets nobody new in, until
-  unlocked. Someone who lost the connection can still take their seat back.
+- **Lock** the session (🔓 / 🔒 in the top bar): the link lets nobody new in,
+  until unlocked. Someone who lost the connection can still take their seat back.
 - **Remove** someone (✕ next to their name). Their tab can't take its seat back;
   opening the link again counts as a new arrival, so lock first if needed.
 

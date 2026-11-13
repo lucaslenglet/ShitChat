@@ -32,55 +32,11 @@
         placeholder="Password (optional)" aria-label="Password (optional)">
       <details id="advanced" class="advanced">
         <summary>Advanced options</summary>
-        <div class="opts">
-          <label for="opt-max">Max people</label>
-          <input id="opt-max" type="number" min="2" max="100" step="1" inputmode="numeric"
-            placeholder="No limit">
-          <label for="opt-chat">Who can write</label>
-          <select id="opt-chat">
-            <option value="all">Everyone</option>
-            <option value="host">Only me</option>
-          </select>
-          <label for="opt-files">Who can send files</label>
-          <select id="opt-files">
-            <option value="all">Everyone</option>
-            <option value="host">Only me</option>
-          </select>
-          <label for="opt-maxfile">Max file size</label>
-          <div class="unit">
-            <input id="opt-maxfile" type="number" min="1" max="50" step="1" inputmode="numeric"
-              placeholder="50">
-            <span>MB</span>
-          </div>
-          <label for="opt-autoload">Received files</label>
-          <select id="opt-autoload">
-            <option value="no">On demand</option>
-            <option value="yes">Automatic</option>
-          </select>
-          <label for="opt-history">Newcomers see</label>
-          <select id="opt-history">
-            <option value="all">Everything</option>
-            <option value="none">Only new ones</option>
-          </select>
-          <label for="opt-receipts">Read receipts</label>
-          <select id="opt-receipts">
-            <option value="on">On</option>
-            <option value="off">Off</option>
-          </select>
-          <label for="opt-typing">"Is typing…"</label>
-          <select id="opt-typing">
-            <option value="on">On</option>
-            <option value="off">Off</option>
-          </select>
-        </div>
-        <p class="opts-hint">Max people counts you too. Someone who loses the connection keeps
-          their seat for 30 minutes. During the session, you can also lock the door (Invite)
-          and remove people (✕ next to their name).</p>
+        <div id="home-opts" class="opts"></div>
       </details>
-      <button id="primary-btn" class="btn primary big" type="submit" disabled>Create a session</button>
+      <button id="primary-btn" class="btn primary big loading" type="submit" disabled>Loading…</button>
     </form>
-    <progress id="load-progress" max="1" value="0"></progress>
-    <p id="status" class="status" role="status">Loading the WireGuard engine…</p>
+    <p id="status" class="status" role="status" hidden></p>
   </div>
   <footer class="footer">
     Experimental · encrypted traffic goes through Tailscale's DERP relays ·
@@ -96,28 +52,22 @@
       <span id="locked-pill" class="pill" title="Locked: nobody new can join" aria-label="Locked" hidden>🔒</span>
     </div>
     <div class="actions">
-      <button id="invite-btn" class="btn" type="button">Invite</button>
+      <button id="settings-btn" class="btn icon" type="button" aria-haspopup="dialog"
+        aria-label="Session settings" title="Session settings">⚙️</button>
+      <button id="lock-btn" class="btn icon" type="button" hidden></button>
+      <button id="invite-btn" class="btn" type="button" aria-haspopup="dialog">Invite</button>
       <button id="leave-btn" class="btn danger" type="button">Leave</button>
     </div>
   </header>
 
-  <section id="invite" class="invite" hidden>
-    <p id="invite-open">Send this link to the people you want to invite. <b>Anyone with the link can join</b>
-      while the session exists.</p>
-    <p id="invite-locked" hidden>Send this link to the people you want to invite. They'll also need
-      <b>the password</b>: send it through another channel.</p>
-    <div class="linkrow">
-      <input id="invite-link" readonly aria-label="Invite link">
-      <button id="copy-btn" class="btn primary" type="button">Copy</button>
-      <button id="share-btn" class="btn" type="button" hidden>Share</button>
-    </div>
-    <div id="door" class="door" hidden>
-      <span id="door-text"></span>
-      <button id="lock-btn" class="btn small" type="button"></button>
-    </div>
-  </section>
 
-  <p id="conn" class="conn" role="status" hidden></p>
+  <div id="conn" class="conn" role="status" hidden>
+    <span class="conn-radar" aria-hidden="true"></span>
+    <span class="conn-text">
+      <b>Reconnecting<span class="wave" aria-hidden="true"><i></i><i></i><i></i></span></b>
+      <span id="conn-sub" class="conn-sub"></span>
+    </span>
+  </div>
 
   <ul id="roster" class="roster" aria-label="Participants"></ul>
 
@@ -139,6 +89,38 @@
 
   <div id="drop-hint" class="drop-hint" hidden>Drop to send</div>
 </main>
+
+<dialog id="settings" class="sheet" aria-labelledby="settings-title">
+  <div class="sheet-body" tabindex="-1" autofocus>
+    <div class="sheet-grip" aria-hidden="true"></div>
+    <div class="sheet-head">
+      <h2 id="settings-title">Session settings</h2>
+      <button class="btn icon" type="button" aria-label="Close" data-close>✕</button>
+    </div>
+    <p id="settings-note" class="sheet-text"></p>
+    <div id="live-opts" class="opts"></div>
+  </div>
+</dialog>
+
+<dialog id="invite" class="sheet" aria-labelledby="invite-title">
+  <div class="sheet-body" tabindex="-1" autofocus>
+    <div class="sheet-grip" aria-hidden="true"></div>
+    <div class="sheet-head">
+      <h2 id="invite-title">Invite people</h2>
+      <button class="btn icon" type="button" aria-label="Close" data-close>✕</button>
+    </div>
+    <p id="invite-open" class="sheet-text">Anyone with the link can join, as long as the session exists.</p>
+    <p id="invite-locked" class="sheet-text" hidden>They'll also need <b>the password</b>: send it
+      through another channel.</p>
+    <p id="invite-shut" class="sheet-text" hidden>🔒 The session is locked: the link lets nobody new
+      in for now.</p>
+    <input id="invite-link" class="linkbox" readonly aria-label="Invite link">
+    <div class="sheet-actions">
+      <button id="share-btn" class="btn primary big" type="button" hidden>Share the link</button>
+      <button id="copy-btn" class="btn primary big" type="button">Copy the link</button>
+    </div>
+  </div>
+</dialog>
 
 <dialog id="viewer" class="viewer" aria-label="Photo">
   <div class="viewer-bar">
