@@ -1310,7 +1310,10 @@ function sendMessage() {
 // A press that starts inside (selecting the link…) and ends outside doesn't count.
 for (const d of document.querySelectorAll("dialog.sheet")) {
   let downOnBackdrop = false;
-  d.onpointerdown = (e) => (downOnBackdrop = e.target === d);
+  // Braces: an on* handler that returns false cancels the event (no focus, no picker).
+  d.onpointerdown = (e) => {
+    downOnBackdrop = e.target === d;
+  };
   d.onclick = (e) => {
     if ((e.target === d && downOnBackdrop) || e.target.closest("[data-close]")) d.close();
   };
