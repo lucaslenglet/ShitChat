@@ -4,7 +4,9 @@
 // web/ package) exposes two globals: tailcatListen and tailcatDial.
 // core.js implements the chat protocol on top of them.
 
-import { Hub, join, makeSecret, HOST_ID, MAX_TEXT, MAX_FILE, PROTO, GRACE_MS } from "./core.js";
+import {
+  Hub, join, makeSecret, cleanSettings, HOST_ID, MAX_TEXT, MAX_FILE, PROTO, GRACE_MS, DEFAULT_SETTINGS,
+} from "./core.js";
 import { randomName } from "./names.js";
 
 const params = new URLSearchParams(location.search);
@@ -38,6 +40,7 @@ const S = {
   authPending: false, // guest: the host asked for the password
   me: null, // {id, name, token}
   hostId: HOST_ID,
+  settings: DEFAULT_SETTINGS,
   addr: "",
   link: "",
   peers: new Map(), // id -> {id, name, delivered, seen}
@@ -53,6 +56,7 @@ const S = {
   uploading: false,
   downQueue: new Set(), // msg ids of files to fetch
   downloading: false,
+  saveWhenDone: new Set(), // msg ids of files to save once fetched
 };
 
 // ---------- Small helpers ----------
@@ -244,16 +248,36 @@ async function bootWasm() {
 const primaryBtn = $("primary-btn");
 const passwordInput = $("password");
 
+const advanced = $("advanced");
+
+function setFormDisabled(off) {
+  primaryBtn.disabled = off;
+  passwordInput.disabled = off;
+  for (const x of advanced.querySelectorAll("input, select")) x.disabled = off;
+}
+
 function busy(text) {
-  primaryBtn.disabled = true;
-  passwordInput.disabled = true;
+  setFormDisabled(true);
   setStatus(text);
 }
 
 function failed(text) {
-  primaryBtn.disabled = false;
-  passwordInput.disabled = false;
+  setFormDisabled(false);
   setStatus(text, true);
+}
+
+// chosenSettings reads the advanced options of the home screen.
+function chosenSettings() {
+  return cleanSettings({
+    maxPeople: Number($("opt-max").value) || 0,
+    chat: $("opt-chat").value,
+    files: $("opt-files").value,
+    maxFile: Math.round((Number($("opt-maxfile").value) || 0) * (1 << 20)),
+    autoload: $("opt-autoload").value === "yes",
+    history: $("opt-history").value,
+    receipts: $("opt-receipts").value === "on",
+    typing: $("opt-typing").value === "on",
+  });
 }
 
 // hostSession creates a session, or resumes the saved one after a reload.
@@ -263,7 +287,8 @@ async function hostSession(saved = null) {
   try {
     const password = saved ? "" : passwordInput.value;
     const secret = password ? await makeSecret(password) : null;
-    hub = new Hub({ makeName: randomName, snapshot: saved?.hub, secret, onChange: saveHostSoon });
+    const settings = saved ? null : chosenSettings();
+    hub = new Hub({ makeName: randomName, snapshot: saved?.hub, secret, settings, onChange: saveHostSoon });
     const addr = await hub.listen(globalThis.tailcatListen, { derpMapURL, verbose });
     S.isHost = true;
     S.resumed = !!saved;
@@ -273,8 +298,6 @@ async function hostSession(saved = null) {
     saveHost();
     S.session = hub.openLocal(onEvent);
     passwordInput.value = "";
-    $("invite-open").hidden = !!hub.secret;
-    $("invite-locked").hidden = !hub.secret;
     $("invite").hidden = !!saved;
   } catch (err) {
     hub?.end();
@@ -282,6 +305,8 @@ async function hostSession(saved = null) {
     inviteAddr = null;
     $("invite-note").hidden = true;
     primaryBtn.textContent = "Create a session";
+    passwordInput.hidden = false;
+    advanced.hidden = false;
     failed(`Couldn't ${saved ? "restore" : "create"} the session: ${err.message}`);
   }
 }
@@ -320,6 +345,7 @@ function askPassword(wrong) {
   S.authPending = true;
   passwordInput.hidden = false;
   passwordInput.disabled = false;
+  advanced.hidden = true;
   passwordInput.required = true;
   passwordInput.placeholder = "Password";
   passwordInput.setAttribute("aria-label", "Password");
@@ -352,6 +378,8 @@ function onEvent(m) {
       return onWelcome(m);
     case "roster":
       return onRoster(m);
+    case "settings":
+      return onSettings(m);
     case "msg":
       return onMsg(m);
     case "typing":
@@ -378,6 +406,8 @@ function onWelcome(m) {
   const first = !S.me;
   S.me = m.you;
   S.hostId = m.hostId;
+  S.settings = cleanSettings(m.settings);
+  applySettings();
   if (!S.isHost) save({ role: "guest", addr: S.addr, resume: { id: m.you.id, token: m.you.token } });
   setPeers(m.peers);
   S.typing.clear();
@@ -404,6 +434,7 @@ function onWelcome(m) {
         ? `Session created. You are ${S.me.name}. Share the link to invite people.`
         : `You joined the session as ${S.me.name}.`,
     );
+    for (const note of settingsNotes()) system(note);
   }
   S.upQueue = S.upQueue.filter((cid) => unsent.some(([c]) => c === cid));
   for (const [cid, li] of unsent) {
@@ -430,6 +461,49 @@ function onWelcome(m) {
   if (first) $("input").focus();
 }
 
+const may = (what) => S.me?.id === S.hostId || S.settings[what] === "all";
+const amHost = () => !!S.me && S.me.id === S.hostId;
+
+// applySettings adapts the page to what the host allows.
+function applySettings() {
+  const locked = S.settings.locked;
+  $("locked-pill").hidden = !locked;
+  $("door").hidden = !amHost();
+  // The invite text (open / needs the password) makes no sense while locked.
+  const secret = !!S.hub?.secret;
+  $("invite-open").hidden = locked || secret;
+  $("invite-locked").hidden = locked || !secret;
+  $("door-text").textContent = locked
+    ? "🔒 Locked: the link lets nobody new in."
+    : "🔓 Open: anyone with the link can join.";
+  $("lock-btn").textContent = locked ? "Unlock" : "Lock";
+  const chat = may("chat");
+  input.disabled = !chat;
+  $("send-btn").disabled = !chat;
+  input.placeholder = chat ? "Write a message…" : "Only the host can write";
+  const files = may("files");
+  $("attach-btn").hidden = !files;
+  $("camera-btn").hidden = !files || !matchMedia("(pointer: coarse)").matches;
+}
+
+// settingsNotes describes the session's rules, for the first welcome.
+function settingsNotes() {
+  const s = S.settings;
+  const host = S.me.id === S.hostId;
+  const notes = [];
+  if (s.maxPeople) notes.push(`This session is limited to ${s.maxPeople} people.`);
+  if (s.chat === "host") notes.push(host ? "Only you can write in this session." : "Only the host can write in this session.");
+  if (s.files === "host" && s.chat !== "host") {
+    notes.push(host ? "Only you can send files." : "Only the host can send files.");
+  }
+  if (s.maxFile < MAX_FILE && (s.files === "all" || host)) notes.push(`Files are limited to ${fmtSize(s.maxFile)}.`);
+  if (s.history === "none") notes.push("Newcomers don't see the messages sent before they joined.");
+  if (!s.receipts) notes.push("Read receipts are off.");
+  if (!s.typing) notes.push('"Is typing…" is off.');
+  if (s.locked) notes.push("The session is locked: nobody new can join.");
+  return notes;
+}
+
 function onReconnecting(m) {
   stopTyping(false);
   S.typing.clear();
@@ -446,6 +520,7 @@ const ROSTER_VERBS = {
   back: "is back",
   lost: "lost the connection",
   leave: "left",
+  kicked: "was removed by the host",
 };
 
 function onRoster(m) {
@@ -454,6 +529,19 @@ function onRoster(m) {
   renderRoster();
   renderTyping();
   refreshTicks();
+}
+
+function onSettings(m) {
+  const was = S.settings.locked;
+  S.settings = cleanSettings(m.settings);
+  applySettings();
+  if (S.settings.locked !== was) {
+    system(
+      S.settings.locked
+        ? "The session is now locked: nobody new can join."
+        : "The session is open again: anyone with the link can join.",
+    );
+  }
 }
 
 function onMsg(m) {
@@ -493,6 +581,15 @@ function onClosed(reason) {
       "Access denied",
       "Too many wrong passwords, or it took too long to type one. Open the link again to retry.",
     );
+  } else if (reason === "kicked") {
+    showEnded("Removed", "The host removed you from the session. The messages are gone from this tab.");
+  } else if (reason === "locked") {
+    showEnded("Session locked", "The host isn't letting anyone new in right now. Ask them to unlock it, then open the link again.");
+  } else if (reason === "full") {
+    showEnded(
+      "Session full",
+      "This session has reached the number of people its host allowed. Ask them to make room, then open the link again.",
+    );
   } else if (reason === "expired") {
     showEnded(
       "Session expired",
@@ -523,6 +620,7 @@ function showEnded(title, text) {
   S.gone.clear();
   S.upQueue = [];
   S.downQueue.clear();
+  S.saveWhenDone.clear();
   $("messages").replaceChildren();
   $("ended-title").textContent = title;
   $("ended-text").textContent = text;
@@ -614,8 +712,8 @@ function renderMsg(m) {
   li.dataset.id = m.id;
   if (m.file) {
     li._meta = m.file;
+    if (S.settings.autoload) wantFile(m.id);
     paintAtt(li);
-    wantFile(m.id);
   }
   li.querySelector("time").textContent = fmtTime(m.ts);
   S.lastMsgId = Math.max(S.lastMsgId, m.id);
@@ -644,12 +742,12 @@ function refreshTicks() {
   let lastId = 0;
   for (const id of S.mine.keys()) lastId = Math.max(lastId, id);
   for (const [id, li] of S.mine) {
-    const st = statusFor(id, others);
+    const st = S.settings.receipts ? statusFor(id, others) : { ticks: "✓", cls: "sent", label: "Sent" };
     const t = li.querySelector(".ticks");
     t.textContent = st.ticks;
     t.className = `ticks ${st.cls}`;
     t.title = st.label;
-    li.querySelector(".receipt").textContent = id === lastId ? st.label : "";
+    li.querySelector(".receipt").textContent = id === lastId && S.settings.receipts ? st.label : "";
   }
 }
 
@@ -668,6 +766,18 @@ function renderRoster() {
       b.className = "badge";
       b.textContent = `(${tags.join(", ")})`;
       li.append(b);
+    }
+    if (amHost() && p.id !== S.me.id) {
+      const x = el("button", "kick", "✕");
+      x.type = "button";
+      x.title = `Remove ${p.name}`;
+      x.setAttribute("aria-label", `Remove ${p.name}`);
+      x.onclick = () => {
+        if (confirm(`Remove ${p.name} from the session? They can come back with the link unless you lock it.`)) {
+          S.session?.send({ t: "kick", id: p.id });
+        }
+      };
+      li.append(x);
     }
     ul.append(li);
   }
@@ -748,7 +858,9 @@ function paintAtt(li) {
         ? "ready"
         : S.gone.has(id)
           ? "gone"
-          : "receiving";
+          : S.downQueue.has(id)
+            ? "receiving"
+            : "idle";
   const key = `${state} ${entry?.url ?? ""} ${entry?.kind ?? ""}`;
   if (box.dataset.key === key) return;
   box.dataset.key = key;
@@ -788,7 +900,7 @@ function paintAtt(li) {
 
   const bar = el("div", "filebar");
   const info = el("div", "fileinfo");
-  if (!media) info.append(el("span", "fileicon", "📄"));
+  if (!media) info.append(el("span", "fileicon", kindOf(meta.type) === "file" ? "📄" : "🖼️"));
   const label = el("div", "filelabel");
   const fname = el("span", "filename", meta.name);
   fname.title = meta.name;
@@ -804,6 +916,21 @@ function paintAtt(li) {
       b.onclick = () => share(entry);
       actions.append(b);
     }
+    bar.append(actions);
+  } else if (state === "idle") {
+    // Not fetched yet: a photo or video shows up in the chat once
+    // loaded, any other file is saved right away.
+    const media = kindOf(meta.type) !== "file";
+    const b = el("button", "btn small", media ? "Load" : "Download");
+    b.type = "button";
+    b.title = media ? `Show ${meta.name} in the chat` : `Download ${meta.name}`;
+    b.onclick = () => {
+      if (!media) S.saveWhenDone.add(id);
+      wantFile(id);
+      paintAtt(li);
+    };
+    const actions = el("div", "fileactions");
+    actions.append(b);
     bar.append(actions);
   }
   box.append(bar);
@@ -832,10 +959,14 @@ function setProgress(li, n) {
 }
 
 function sendFiles(files) {
-  if (!S.session || !S.me || S.closed) return;
+  if (!S.session || !S.me || S.closed || !files.length) return;
+  if (!may("files")) {
+    system("Only the host can send files in this session.");
+    return;
+  }
   for (const file of files) {
-    if (file.size > MAX_FILE) {
-      system(`"${file.name}" is too big to send (${fmtSize(file.size)}, the limit is ${fmtSize(MAX_FILE)}).`);
+    if (file.size > S.settings.maxFile) {
+      system(`"${file.name}" is too big to send (${fmtSize(file.size)}, the limit is ${fmtSize(S.settings.maxFile)}).`);
       continue;
     }
     const cid = newCid();
@@ -873,7 +1004,7 @@ async function pumpUploads() {
         if (!err.refused) break;
         S.upQueue.shift();
         S.pending.delete(cid);
-        li._failed = err.message === "too-big" ? "too big" : err.message;
+        li._failed = { "too-big": "too big", "not-allowed": "only the host can send files" }[err.message] ?? err.message;
         li.classList.remove("pending");
         li.querySelector(".ticks").textContent = "⚠️";
         paintAtt(li);
@@ -906,10 +1037,13 @@ async function pumpDownloads() {
         const blob = await S.session.getFile(id, meta, (n) => setProgress(findMsg(id), n));
         if (S.closed) break;
         S.downQueue.delete(id);
-        S.blobs.set(id, fileEntry(blob, meta));
+        const entry = fileEntry(blob, meta);
+        S.blobs.set(id, entry);
+        if (S.saveWhenDone.delete(id)) saveLink(entry).click();
       } catch (err) {
         if (!err.gone) break;
         S.downQueue.delete(id);
+        S.saveWhenDone.delete(id);
         S.gone.add(id);
       }
       const li = findMsg(id);
@@ -921,7 +1055,6 @@ async function pumpDownloads() {
 }
 
 $("attach-btn").onclick = () => $("file-input").click();
-$("camera-btn").hidden = !matchMedia("(pointer: coarse)").matches;
 $("camera-btn").onclick = () => $("camera-input").click();
 for (const id of ["file-input", "camera-input"]) {
   $(id).onchange = (e) => {
@@ -998,7 +1131,7 @@ viewer.addEventListener("click", (e) => {
 // ---------- Receipts ----------
 
 function sendReceipts() {
-  if (!S.session || S.closed) return;
+  if (!S.session || S.closed || !S.settings.receipts) return;
   const delivered = S.lastMsgId;
   const seen = isActive() ? S.lastMsgId : S.sentReceipt.seen;
   if (delivered === S.sentReceipt.delivered && seen === S.sentReceipt.seen) return;
@@ -1036,7 +1169,7 @@ input.addEventListener("input", () => {
   autosize();
   if (!S.session) return;
   if (!input.value.trim()) return stopTyping(true);
-  if (!typingOn) {
+  if (!typingOn && S.settings.typing) {
     typingOn = true;
     S.session.send({ t: "typing", on: true });
   }
@@ -1075,6 +1208,8 @@ function sendMessage() {
 }
 
 // ---------- Invite / leave ----------
+
+$("lock-btn").onclick = () => S.session?.send({ t: "lock", on: !S.settings.locked });
 
 $("invite-btn").onclick = () => {
   $("invite").hidden = !$("invite").hidden;
@@ -1143,9 +1278,12 @@ window.addEventListener("pagehide", () => {
 
 // ---------- Go ----------
 
+$("camera-btn").hidden = !matchMedia("(pointer: coarse)").matches;
+
 if (inviteAddr) {
   $("invite-note").hidden = false;
   passwordInput.hidden = true;
+  advanced.hidden = true;
   primaryBtn.textContent = "Join the session";
 }
 
@@ -1160,6 +1298,7 @@ try {
 $("load-progress").hidden = true;
 
 const saved = await savedSession;
+if (saved) advanced.hidden = true;
 if (saved?.role === "host") {
   hostSession(saved);
 } else if (saved?.role === "guest") {
@@ -1168,7 +1307,6 @@ if (saved?.role === "host") {
 } else if (inviteAddr) {
   joinSession();
 } else {
-  primaryBtn.disabled = false;
-  passwordInput.disabled = false;
+  setFormDisabled(false);
   setStatus("Ready.");
 }

@@ -26,6 +26,7 @@ Self-destructing, end-to-end encrypted browser chat over [tailcat](https://githu
 
 - After editing `web/`, `cp web/* dist/` is enough (no need to rebuild the wasm).
 - `python3 -m http.server -d dist 8000` to serve.
+- `node test/settings.mjs`: session settings over a fake in-memory tailcat (seconds, offline).
 - `node test/e2e.mjs dist`: protocol test over the real DERP relays (~2.5 min, needs network).
   Wrap it in `timeout 400`: it hangs ~1 run in 2 at the host-reload step, inside the tailcat wasm
   (pre-existing, test-only: same key re-listened in one Go process). Rerun if it does.

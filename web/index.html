@@ -30,6 +30,53 @@
     <form id="start" class="start">
       <input id="password" type="password" maxlength="1024" autocomplete="new-password"
         placeholder="Password (optional)" aria-label="Password (optional)">
+      <details id="advanced" class="advanced">
+        <summary>Advanced options</summary>
+        <div class="opts">
+          <label for="opt-max">Max people</label>
+          <input id="opt-max" type="number" min="2" max="100" step="1" inputmode="numeric"
+            placeholder="No limit">
+          <label for="opt-chat">Who can write</label>
+          <select id="opt-chat">
+            <option value="all">Everyone</option>
+            <option value="host">Only me</option>
+          </select>
+          <label for="opt-files">Who can send files</label>
+          <select id="opt-files">
+            <option value="all">Everyone</option>
+            <option value="host">Only me</option>
+          </select>
+          <label for="opt-maxfile">Max file size</label>
+          <div class="unit">
+            <input id="opt-maxfile" type="number" min="1" max="50" step="1" inputmode="numeric"
+              placeholder="50">
+            <span>MB</span>
+          </div>
+          <label for="opt-autoload">Received files</label>
+          <select id="opt-autoload">
+            <option value="no">On demand</option>
+            <option value="yes">Automatic</option>
+          </select>
+          <label for="opt-history">Newcomers see</label>
+          <select id="opt-history">
+            <option value="all">Everything</option>
+            <option value="none">Only new ones</option>
+          </select>
+          <label for="opt-receipts">Read receipts</label>
+          <select id="opt-receipts">
+            <option value="on">On</option>
+            <option value="off">Off</option>
+          </select>
+          <label for="opt-typing">"Is typing…"</label>
+          <select id="opt-typing">
+            <option value="on">On</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <p class="opts-hint">Max people counts you too. Someone who loses the connection keeps
+          their seat for 30 minutes. During the session, you can also lock the door (Invite)
+          and remove people (✕ next to their name).</p>
+      </details>
       <button id="primary-btn" class="btn primary big" type="submit" disabled>Create a session</button>
     </form>
     <progress id="load-progress" max="1" value="0"></progress>
@@ -46,6 +93,7 @@
     <div class="brand">
       <span class="logo small">Shit<span>Chat</span></span>
       <span id="online" class="pill"></span>
+      <span id="locked-pill" class="pill" title="Locked: nobody new can join" aria-label="Locked" hidden>🔒</span>
     </div>
     <div class="actions">
       <button id="invite-btn" class="btn" type="button">Invite</button>
@@ -62,6 +110,10 @@
       <input id="invite-link" readonly aria-label="Invite link">
       <button id="copy-btn" class="btn primary" type="button">Copy</button>
       <button id="share-btn" class="btn" type="button" hidden>Share</button>
+    </div>
+    <div id="door" class="door" hidden>
+      <span id="door-text"></span>
+      <button id="lock-btn" class="btn small" type="button"></button>
     </div>
   </section>
 

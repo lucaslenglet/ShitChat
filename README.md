@@ -6,14 +6,16 @@ the host leaves. Just a static page on GitHub Pages.
 👉 **https://lucaslenglet.github.io/ShitChat/**
 
 1. Click **Create a session**: your tab becomes the host and gives you a link.
-   You can set a **password** first (optional).
+   You can set a **password** first (optional), and tweak the session under
+   **Advanced options** (see below).
 2. Send the link to whoever you want. Opening it joins the session under a random
    name ("Philosophical Capybara", "Cranky Narwhal"…), after typing the password
    if there is one.
 3. Chat away: participant count, "X is typing…", sent / delivered / seen.
-   Send **photos and files** with 📎 (or 📷 on a phone, or paste / drop them):
-   photos show up in the chat, tap one to view it full screen, and every file
-   has a **Save** button (and **Share** on Android, e.g. to put a photo in your
+   Send **photos and files** with 📎 (or 📷 on a phone, or paste / drop them).
+   Received ones arrive as a name and a size: **Load** shows a photo in the chat
+   (tap it to view it full screen), **Download** saves a file. Then each one has a
+   **Save** button (and **Share** on Android, e.g. to put a photo in your
    gallery). Up to 50 MB per file.
 4. When the host closes their tab (or clicks **Destroy**), everyone is disconnected,
    the messages vanish and **the link will never work again**.
@@ -25,6 +27,30 @@ up where you were (same name, same messages). Only closing the tab does.
 *Add to Home Screen*). It's just a web app manifest: there's no service worker, so
 nothing is cached or stored on the device. On Android, invite links then open
 directly in the app.
+
+### Advanced options
+
+Folded under the password field when creating a session. The defaults are an
+open room where everyone can do everything. The host's tab enforces them; "who
+can write / send files" never restricts the host itself.
+
+- **Max people** (host included): newcomers past it are turned away. Someone who
+  loses the connection keeps their seat for 30 minutes; someone who leaves frees it.
+- **Who can write**: everyone, or only the host (announcement mode).
+- **Who can send files**: everyone, or only the host.
+- **Received files**: *on demand* (each participant chooses what to fetch), or
+  *automatic* (everything is fetched as soon as it's posted).
+- **Max file size**: anything from 1 to 50 MB.
+- **Newcomers see**: *everything* sent since the session started, or *only new
+  ones* (what's posted after they joined, files included).
+- **Read receipts** and **"Is typing…"**: on or off, for everyone.
+
+And during the session, the host can:
+
+- **Lock** the session (in the Invite panel): the link lets nobody new in, until
+  unlocked. Someone who lost the connection can still take their seat back.
+- **Remove** someone (✕ next to their name). Their tab can't take its seat back;
+  opening the link again counts as a new arrival, so lock first if needed.
 
 ## How it works
 
@@ -67,8 +93,9 @@ server. tailcat is compiled to WebAssembly and runs right in the browser.
   three per connection.
 - **Files.** The sender streams the file to the host, which keeps it **in memory
   only** (up to 150 MB for all files together, the oldest go first) and posts a
-  message about it. Everyone's tab then fetches it from the host automatically and
-  keeps it in memory too, as a `blob:` URL. Nothing is written to disk unless you
+  message about it. Each participant's tab fetches it from the host when they ask
+  for it (or right away, if the host chose so) and keeps it in memory too, as a
+  `blob:` URL. Nothing is written to disk unless you
   press Save. File transfers go at a lower priority than messages, so the chat
   keeps flowing during a transfer. Through the relays, expect a few hundred KB/s
   (~700 KB/s measured): a phone photo takes a few seconds, a 50 MB video about two

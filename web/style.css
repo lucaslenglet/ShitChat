@@ -172,6 +172,48 @@ progress::-moz-progress-bar { background: var(--accent); }
 .start input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .start input:disabled { opacity: 0.5; }
 
+.advanced { font-size: 0.95rem; }
+.advanced summary { cursor: pointer; color: var(--muted); padding: 4px 0; }
+.advanced[open] summary { margin-bottom: 8px; }
+.opts { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center; }
+.opts label { color: var(--muted); }
+.opts input, .opts select {
+  width: 100%;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+.opts input:focus, .opts select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.unit { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.unit span { color: var(--muted); }
+.door {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 0.9rem;
+}
+.door span { color: var(--muted); }
+.roster .kick {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 2px;
+  margin-left: 2px;
+  font: inherit;
+  line-height: 1;
+}
+.roster .kick:hover { color: var(--danger); }
+.opts-hint { margin: 8px 0 0; color: var(--muted); font-size: 0.8rem; }
+.composer textarea:disabled { opacity: 0.6; }
+
 /* Chat layout */
 #chat {
   flex-direction: column;
@@ -529,3 +571,5 @@ progress::-moz-progress-bar { background: var(--accent); }
   .composer .btn { padding: 10px 12px; }
   .composer .btn.icon { padding: 9px 8px; }
 }
+#locked-pill { padding: 2px 8px; }
+#locked-pill::before { display: none; }
