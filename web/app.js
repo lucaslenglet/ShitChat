@@ -756,6 +756,7 @@ function paintAtt(li) {
   box.replaceChildren();
 
   const media = entry && entry.kind !== "file" && state !== "failed";
+  box.parentElement.classList.toggle("media", !!media);
   if (media) {
     const broken = () => {
       entry.kind = "file"; // a format this browser can't show (HEIC…)
@@ -789,7 +790,9 @@ function paintAtt(li) {
   const info = el("div", "fileinfo");
   if (!media) info.append(el("span", "fileicon", "📄"));
   const label = el("div", "filelabel");
-  label.append(el("span", "filename", meta.name), el("span", "filesize", fmtSize(meta.size)));
+  const fname = el("span", "filename", meta.name);
+  fname.title = meta.name;
+  label.append(fname, el("span", "filesize", fmtSize(meta.size)));
   info.append(label);
   bar.append(info);
   if (state === "ready") {
